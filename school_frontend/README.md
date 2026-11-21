@@ -82,11 +82,17 @@ Same-origin is what makes the refresh cookie work: it is httpOnly, `SameSite=Str
 ## Checks
 
 ```bash
-npm run typecheck     # tsc -b
+npm run typecheck     # tsc -b (also checks tests/)
+npm test              # 42 unit tests: date/money formatting + the API wrapper
 npm run lint          # oxlint (0 errors; 10 warnings: "copy server rows into an editable grid" effects — intentional)
 npm run build
 npm run test:e2e      # needs API + dev server + DEMO database
 ```
+
+`tests/unit/` covers the two places where a quiet mistake reaches a parent: `format.ts`
+(a date rendered with `toISOString()` is the UTC date, which is yesterday in Nepal until
+05:45) and `api.ts` (the 401 → refresh → retry path, which must not log a user out when
+they were fine, and must not retry in a loop when they are not).
 
 `tests/e2e/ui.mjs` (Playwright) signs in as admin, teacher, accountant, parent and student, then at phone size as admin and parent. It opens every screen each role can use, including the edit-guardian and edit-exam modals and the optional-subjects card. It **fails** on any JavaScript error, any failed API call or a visible error boundary. It also checks that forbidden pages stay forbidden and that no page is wider than a phone. Screenshots land in `screenshots/`. Use `BASE=https://… npm run test:e2e` to point it at another server.
 
@@ -99,6 +105,7 @@ src/
   components/ ui.tsx (buttons, forms, modal, tabs, toasts…), ui-utils.ts, Layout.tsx (permission-driven sidebar),
               ErrorBoundary.tsx, SchoolLogo.tsx, SchoolLetterhead.tsx, AccountModal.tsx, StudentPicker.tsx
   pages/      one folder per area; each page is lazy-loaded (initial JS ≈ 100 KB gzip)
+tests/unit/   format.test.ts, api.test.ts — pure logic, no browser (npm test)
 tests/e2e/    ui.mjs — browser smoke test for every role
 ```
 
