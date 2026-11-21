@@ -25,6 +25,9 @@ export function examsRouter(c: ExamsController, guards: AuthGuards) {
   r.post('/:id/verify', requirePermission('marks.approve'), c.verify);
   r.post('/:id/process', requirePermission('results.process'), c.process);
   r.post('/:id/publish', requirePermission('results.publish'), c.publish);
+  // Withholding is a decision, not a calculation: it needs results.publish (the same
+  // authority that releases a result), not results.process.
+  r.post('/:id/withhold', requirePermission('results.publish'), c.withhold);
   r.get('/:id/results', requirePermission('results.view'), c.results);
   // students/parents: own report card after publishing (checked in business layer)
   r.get('/:id/report-cards/:studentId', c.reportCard);

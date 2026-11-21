@@ -1,3 +1,5 @@
+import { round2 } from '../../../shared/money.js';
+
 /**
  * NEB GRADING — pure functions (no DB, no HTTP). Fully unit-tested in tests/unit/grading.test.ts
  *
@@ -62,12 +64,59 @@ export interface StudentResult {
   status: ResultStatus;
 }
 
-export const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+// Percentages, grade points and GPA all use the same 2-decimal rounding as money.
+export { round2 } from '../../../shared/money.js';
+
+/** Thrown when the configured grading bands do not cover every possible percentage. */
+export class GradingScaleError extends Error {
+  constructor(message: string, readonly gaps: Array<{ from: number; to: number }> = []) {
+    super(message);
+    this.name = 'GradingScaleError';
+  }
+}
 
 export function gradeForPercent(percent: number, bands: GradeBand[]): { grade: string; gradePoint: number | null } {
   const band = bands.find((b) => percent >= b.minPercent && percent < b.maxPercent);
-  if (!band) throw new Error(`No grading band covers ${percent}%`);
+  if (!band) {
+    // A percentage this function cannot grade means the SCALE is wrong, not the mark.
+    // The caller reports it as a configuration problem (see gradingScaleGaps).
+    throw new GradingScaleError(`No grading band covers ${percent}% — the grading scale has a gap`, [
+      { from: percent, to: percent },
+    ]);
+  }
   return { grade: band.grade, gradePoint: band.gradePoint };
+}
+
+/**
+ * Percentages the configured bands do not cover, as [from, to) ranges within 0–100.
+ *
+ * The scale is data an admin enters, so it can be incomplete — e.g. bands that start at
+ * 40 leave 0–40 ungraded. Without this check such a scale only surfaces as a crash
+ * ("No grading band covers 39.6%") in the middle of processing a whole exam, long after
+ * the scale was saved, and the message says nothing about what to fix.
+ */
+export function gradingScaleGaps(bands: GradeBand[]): Array<{ from: number; to: number }> {
+  const TOP = 100.01; // the top band's max_percent is exclusive; the schema allows up to 100.01
+  const sorted = [...bands].sort((a, b) => a.minPercent - b.minPercent);
+  const gaps: Array<{ from: number; to: number }> = [];
+  let cursor = 0;
+  for (const b of sorted) {
+    if (b.minPercent > cursor + 1e-9) {
+      gaps.push({ from: round2(cursor), to: round2(Math.min(b.minPercent, TOP)) });
+    }
+    // overlapping bands are impossible (EXCLUDE constraint), but a malformed in-memory
+    // list must not produce a negative gap
+    if (b.maxPercent > cursor) cursor = b.maxPercent;
+  }
+  if (cursor < TOP - 1e-9) gaps.push({ from: round2(cursor), to: 100 });
+  return gaps;
+}
+
+/** Human-readable summary of missing ranges, e.g. "0–40% and 99–100%". */
+export function describeGaps(gaps: Array<{ from: number; to: number }>): string {
+  const one = (g: { from: number; to: number }) => (g.from === g.to ? `${g.from}%` : `${g.from}–${g.to}%`);
+  if (gaps.length === 1) return `${one(gaps[0])} is not covered by any band`;
+  return `${gaps.slice(0, -1).map(one).join(', ')} and ${one(gaps[gaps.length - 1])} are not covered by any band`;
 }
 
 export function gradeFromGpa(gpa: number): string {

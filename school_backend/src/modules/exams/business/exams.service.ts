@@ -12,7 +12,7 @@ import type {
   ProcessedResult,
   StudentAccess,
 } from './exams.ports.js';
-import { computeStudentResult, rank } from './grading.js';
+import { computeStudentResult, describeGaps, gradingScaleGaps, rank } from './grading.js';
 
 /** BUSINESS LAYER — exams, marks entry, result processing, publishing. */
 export class ExamsService {
@@ -139,6 +139,18 @@ export class ExamsService {
 
     const [bands, rows] = await Promise.all([this.repo.getGradingBands(exam.gradingScaleId), this.repo.loadResultInputs(examId, opts.sectionId)]);
     if (!bands.length) throw badRequest('No grading scale configured');
+
+    // Check the scale BEFORE computing anything. A gap would otherwise throw inside the
+    // per-student loop and abort the whole exam with a 500 that names no fix.
+    const gaps = gradingScaleGaps(bands);
+    if (gaps.length) {
+      throw badRequest(
+        `The grading scale does not cover every mark: ${describeGaps(gaps)}. ` +
+          'Fix the grading scale, then process results again.',
+        { gaps, scaleId: exam.gradingScaleId },
+      );
+    }
+
     if (!rows.length) throw badRequest('Nothing to process — no students or exam papers found');
 
     const missing = rows.filter((r) => !r.hasMark);
@@ -199,6 +211,41 @@ export class ExamsService {
     if (!exam) throw notFound('Exam');
     await this.tx.transaction(actor.userId, (t) => this.repo.setPublished(examId, published, t));
     this.events.publish('results.published', { examId, published, actorUserId: actor.userId });
+  }
+
+  /**
+   * Withhold or release results (unpaid fees, a discipline case, a mark under review).
+   *
+   * A withheld result is deliberately visible to the family as "result withheld" with no
+   * marks — see reportCard/listResults, which null out the numbers — so the office does
+   * not have to lie about why the report card is missing.
+   *
+   * Allowed after publishing: withholding is usually BECAUSE of a published result.
+   */
+  async setWithheld(actor: AuthUser, examId: number, body: { enrollmentIds?: number[]; sectionId?: number; withheld: boolean }) {
+    const exam = await this.repo.getExam(examId);
+    if (!exam) throw notFound('Exam');
+
+    let ids: number[] | null = body.enrollmentIds?.length ? body.enrollmentIds : null;
+    if (!ids && body.sectionId) {
+      // conveniences: "withhold this whole section" — resolve it to enrollment ids so the
+      // response can report exactly what changed
+      ids = await this.repo.enrollmentIdsForSection(exam.academicYearId, body.sectionId);
+      if (!ids.length) throw badRequest('That section has no enrolled students in this exam year');
+    }
+
+    const changed = await this.tx.transaction(actor.userId, (t) =>
+      this.repo.setWithheld(examId, ids, body.withheld, t),
+    );
+    if (!changed.length) {
+      throw conflict(
+        body.withheld
+          ? 'No results to withhold — process the results first'
+          : 'No withheld results matched; nothing to release',
+      );
+    }
+    this.events.publish('results.withheld', { examId, withheld: body.withheld, enrollmentIds: changed, actorUserId: actor.userId });
+    return { withheld: body.withheld, updated: changed.length, enrollmentIds: changed };
   }
 
   listResults(examId: number, sectionId?: number) {

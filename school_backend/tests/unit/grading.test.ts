@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { type ComponentInput, type GradeBand, computeStudentResult, gradeForPercent, gradeFromGpa, rank } from '../../src/modules/exams/business/grading.js';
+import {
+  type ComponentInput,
+  type GradeBand,
+  GradingScaleError,
+  computeStudentResult,
+  describeGaps,
+  gradeForPercent,
+  gradeFromGpa,
+  gradingScaleGaps,
+  rank,
+} from '../../src/modules/exams/business/grading.js';
 
 // Same bands as 99_seed.sql (NEB letter grading)
 const NEB: GradeBand[] = [
@@ -31,6 +41,72 @@ describe('gradeForPercent', () => {
   });
   it('throws when no band covers the value', () => {
     expect(() => gradeForPercent(120, NEB)).toThrow();
+  });
+
+  it('a value outside the configured bands raises a scale error, not a bare Error', () => {
+    // a hand-entered scale that starts at 40 leaves 0-40 ungraded
+    const gap: GradeBand[] = [{ minPercent: 40, maxPercent: 100.01, grade: 'A', gradePoint: 4 }];
+    expect(() => gradeForPercent(39.6, gap)).toThrow(GradingScaleError);
+    expect(() => gradeForPercent(39.6, gap)).toThrow(/gap/);
+  });
+});
+
+describe('gradingScaleGaps', () => {
+  it('the seeded NEB scale covers 0-100 with no gaps', () => {
+    expect(gradingScaleGaps(NEB)).toEqual([]);
+  });
+
+  it('reports a missing range at the bottom', () => {
+    const partial: GradeBand[] = [
+      { minPercent: 80, maxPercent: 100.01, grade: 'A', gradePoint: 4 },
+      { minPercent: 60, maxPercent: 80, grade: 'B', gradePoint: 3 },
+    ];
+    expect(gradingScaleGaps(partial)).toEqual([{ from: 0, to: 60 }]);
+  });
+
+  it('reports a missing range at the top (top band must reach past 100)', () => {
+    const noTop: GradeBand[] = [{ minPercent: 0, maxPercent: 90, grade: 'A', gradePoint: 4 }];
+    expect(gradingScaleGaps(noTop)).toEqual([{ from: 90, to: 100 }]);
+  });
+
+  it('reports a gap in the middle', () => {
+    const holed: GradeBand[] = [
+      { minPercent: 0, maxPercent: 40, grade: 'NG', gradePoint: null },
+      { minPercent: 40, maxPercent: 50, grade: 'C', gradePoint: 2 },
+      { minPercent: 60, maxPercent: 100.01, grade: 'A', gradePoint: 4 },
+    ];
+    expect(gradingScaleGaps(holed)).toEqual([{ from: 50, to: 60 }]);
+  });
+
+  it('treats 100% as covered only when the top band reaches beyond it', () => {
+    // maxPercent is exclusive: a band ending at 100 leaves exactly 100% ungraded
+    const exclusive: GradeBand[] = [{ minPercent: 0, maxPercent: 100, grade: 'A', gradePoint: 4 }];
+    expect(gradingScaleGaps(exclusive)).toEqual([{ from: 100, to: 100 }]);
+    // ...which is why the schema's own top band uses 100.01
+    expect(gradingScaleGaps(NEB)).toEqual([]);
+  });
+
+  it('does not report a gap for an empty scale list here (that is caught as "no scale configured")', () => {
+    expect(gradingScaleGaps([])).toEqual([{ from: 0, to: 100 }]);
+  });
+
+  it('ignores band order', () => {
+    const shuffled = [...NEB].reverse();
+    expect(gradingScaleGaps(shuffled)).toEqual([]);
+  });
+});
+
+describe('describeGaps', () => {
+  it('describes one gap', () => {
+    expect(describeGaps([{ from: 0, to: 40 }])).toBe('0\u201340% is not covered by any band');
+  });
+  it('describes several gaps', () => {
+    expect(describeGaps([{ from: 0, to: 40 }, { from: 50, to: 60 }])).toBe(
+      '0\u201340% and 50\u201360% are not covered by any band',
+    );
+  });
+  it('describes a single percentage point', () => {
+    expect(describeGaps([{ from: 100, to: 100 }])).toBe('100% is not covered by any band');
   });
 });
 
