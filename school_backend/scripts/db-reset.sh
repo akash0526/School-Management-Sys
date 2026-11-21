@@ -71,6 +71,11 @@ echo "• Installing schema, seed and security (install.sql)"
   awk -v dir="$SCHEMA_ABS" '/^\\ir /{ f = dir "/" $2; while ((getline line < f) > 0) print line; close(f); next } { print }' "$SCHEMA_ABS/install.sql"
 } | $PSQL -X -q -v ON_ERROR_STOP=1 -d "$DB_NAME" >/dev/null
 
+# A fresh install already has the current schema, so record the shipped migrations as
+# applied. Without this the API would report the database as "4 migrations behind".
+echo "• Recording schema migrations"
+npx tsx scripts/db-migrate.ts
+
 if [[ $DEMO -eq 1 ]]; then
   echo "• Loading demo school (takes a minute or two)"
   npx tsx scripts/seed-demo.ts

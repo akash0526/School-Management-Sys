@@ -18,7 +18,10 @@
     "test:e2e": "node tests/e2e/smoke.mjs",
     "manage-api-key": "tsx scripts/manage-api-key.ts",
     "db:reset": "bash scripts/db-reset.sh",
-    "db:demo": "bash scripts/db-reset.sh --demo"
+    "db:demo": "bash scripts/db-reset.sh --demo",
+    "db:migrate": "tsx scripts/db-migrate.ts",
+    "db:migrate:status": "tsx scripts/db-migrate.ts --status",
+    "db:test": "tsx scripts/test-constraints.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

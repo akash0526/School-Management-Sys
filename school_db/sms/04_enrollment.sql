@@ -48,8 +48,11 @@ BEGIN
           AND cs.academic_year_id = e.academic_year_id
           AND cs.class_id = s.class_id
           AND (cs.stream_id IS NULL OR cs.stream_id IS NOT DISTINCT FROM s.stream_id)
+          -- only OPTIONAL subjects are "chosen"; a compulsory subject belongs to every
+          -- student of the class already, so storing it here is a data error
+          AND cs.is_optional
     ) THEN
-        RAISE EXCEPTION 'Subject % does not belong to the class/stream/year of enrollment %',
+        RAISE EXCEPTION 'Subject % is not a chosen optional subject of enrollment % (wrong class/stream/year, or it is compulsory)',
             NEW.class_subject_id, NEW.enrollment_id;
     END IF;
     RETURN NEW;

@@ -81,6 +81,12 @@ CREATE TABLE user_sessions (
 );
 CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
 
+-- Every /auth/refresh looks a session up by its token hash. Without this index that is a
+-- sequential scan of the whole session table on the hottest authenticated path — and the lookup
+-- uses SELECT ... FOR UPDATE, so each refresh scans under row locks.
+-- Unique: a token hash identifies exactly one session (the app reads at most one row).
+CREATE UNIQUE INDEX uq_user_sessions_refresh_token ON user_sessions(refresh_token_hash);
+
 CREATE TABLE password_resets (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -89,6 +95,7 @@ CREATE TABLE password_resets (
     used_at     TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX uq_password_resets_token ON password_resets(token_hash);
 
 -- ---------------------------------------------------------------------
 -- Machine clients allowed to call the SMS API (e.g. the public website)
@@ -103,3 +110,7 @@ CREATE TABLE api_clients (
     last_used_at  TIMESTAMPTZ,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Every website API call authenticates by hashing the key and looking it up here, so this must be
+-- an index rather than a scan of all clients. Unique: one key belongs to one client, and the code
+-- takes rows[0] (a duplicate hash would silently authenticate as an arbitrary client).
+CREATE UNIQUE INDEX uq_api_clients_key_hash ON api_clients(api_key_hash);
