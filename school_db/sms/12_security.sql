@@ -100,6 +100,15 @@ CREATE INDEX IF NOT EXISTS idx_security_events_target ON security_events (target
 CREATE OR REPLACE FUNCTION forbid_log_tampering()
 RETURNS trigger AS $$
 BEGIN
+    -- audit_logs has a retention policy (see 0006_audit_log_retention.sql). The guard
+    -- still refuses every ordinary DELETE; it only stands aside when the caller has
+    -- explicitly declared intent for this transaction. `IS NOT DISTINCT FROM` means an
+    -- unset / empty / NULL setting can never enable the bypass by accident.
+    IF TG_OP = 'DELETE'
+       AND TG_TABLE_NAME = 'audit_logs'
+       AND current_setting('app.audit_retention', TRUE) IS NOT DISTINCT FROM 'on' THEN
+        RETURN OLD;
+    END IF;
     RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
 END;
 $$ LANGUAGE plpgsql;
@@ -119,6 +128,54 @@ CREATE TRIGGER trg_security_events_no_truncate BEFORE TRUNCATE ON security_event
 FOR EACH STATEMENT EXECUTE FUNCTION forbid_log_tampering();
 
 -- ---------------------------------------------------------------------
+-- 4b. Retention for audit_logs (kept forever would grow without bound: a
+--     marking season writes an audit row per mark per component).
+--     security_events is deliberately NOT purged — those are authentication
+--     records, small in volume and the first thing an investigation needs.
+-- ---------------------------------------------------------------------
+INSERT INTO settings (key, value)
+VALUES ('audit_log_retention_days', '730'::jsonb)
+ON CONFLICT (key) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION purge_audit_logs(p_days INT DEFAULT NULL)
+RETURNS BIGINT AS $$
+DECLARE
+    v_days     INT;
+    v_cutoff   TIMESTAMPTZ;
+    v_eligible BIGINT;
+    v_deleted  BIGINT := 0;
+BEGIN
+    v_days := COALESCE(p_days, (SELECT (value #>> '{}')::INT FROM settings WHERE key = 'audit_log_retention_days'));
+    IF v_days IS NULL OR v_days <= 0 THEN
+        RAISE NOTICE 'audit retention is disabled (window = %); nothing purged', v_days;
+        RETURN 0;
+    END IF;
+    IF v_days < 30 THEN
+        RAISE EXCEPTION 'refusing to purge audit_logs with a % day window (minimum 30)', v_days;
+    END IF;
+
+    v_cutoff := now() - make_interval(days => v_days);
+    SELECT count(*) INTO v_eligible FROM audit_logs WHERE created_at < v_cutoff;
+
+    -- no argument = dry run: report what is eligible, delete nothing
+    IF p_days IS NULL THEN
+        RAISE NOTICE '% audit_logs row(s) older than % (cutoff %) are eligible', v_eligible, v_days, v_cutoff;
+        RETURN v_eligible;
+    END IF;
+    IF v_eligible = 0 THEN
+        RAISE NOTICE 'no audit_logs rows older than %', v_cutoff;
+        RETURN 0;
+    END IF;
+
+    PERFORM set_config('app.audit_retention', 'on', true);   -- local to this transaction
+    DELETE FROM audit_logs WHERE created_at < v_cutoff;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RAISE NOTICE 'purged % audit_logs row(s) older than %', v_deleted, v_cutoff;
+    RETURN v_deleted;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------------
 -- 5. Application DB role (least privilege). Run as superuser.
 --    The app may read/write business data but may NOT alter schema,
 --    nor modify/delete audit history.
@@ -129,7 +186,21 @@ BEGIN
         EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO school_app';
         EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO school_app';
         EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs, security_events FROM school_app';
+        -- the app may not run the retention purge either: that would be a way around the
+        -- append-only guard it is not allowed to lift
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT) FROM school_app';
+        -- the migration ledger is read-only for the app: it must be able to report whether
+        -- the schema is behind the code, but only a migration may write to it
+        EXECUTE 'GRANT SELECT ON schema_migrations TO school_app';
+        EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON schema_migrations FROM school_app';
         EXECUTE 'REVOKE CREATE ON SCHEMA public FROM school_app';
         EXECUTE 'REVOKE CREATE ON SCHEMA public FROM PUBLIC';
+
+        -- Tables created LATER must also be reachable, otherwise every new table silently
+        -- locks the app out until this script is re-run by hand.
+        EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO school_app';
+        EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                 GRANT USAGE, SELECT ON SEQUENCES TO school_app';
     END IF;
 END $$;

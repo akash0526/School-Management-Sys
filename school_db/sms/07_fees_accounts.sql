@@ -84,6 +84,12 @@ CREATE TABLE invoices (
 CREATE INDEX idx_invoices_enrollment ON invoices (enrollment_id);
 CREATE INDEX idx_invoices_status     ON invoices (status);
 
+-- One live invoice per student per billing period: two cashiers (or a double-click) must never
+-- bill the same period twice. Cancelled invoices are excluded so a period can be re-issued.
+CREATE UNIQUE INDEX uq_invoice_enrollment_period
+    ON invoices (enrollment_id, billing_period)
+    WHERE status <> 'cancelled' AND billing_period IS NOT NULL;
+
 CREATE TABLE invoice_items (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     invoice_id   BIGINT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
@@ -94,6 +100,8 @@ CREATE TABLE invoice_items (
     net_amount   NUMERIC(12,2) GENERATED ALWAYS AS (amount - discount) STORED,
     CHECK (discount <= amount)
 );
+-- invoice detail aggregates one invoice's lines; without this every invoice view scans the table
+CREATE INDEX idx_invoice_items_invoice ON invoice_items (invoice_id);
 
 -- ---------------------------------------------------------------------
 -- Receipts (money received) — one receipt can pay several invoices
