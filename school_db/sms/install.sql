@@ -17,8 +17,10 @@ BEGIN;
 \ir 09_library_transport.sql
 \ir 10_communication_admissions.sql
 \ir 11_audit_views.sql
+\ir 13_migrations.sql
 \ir 98_triggers.sql
 \ir 99_seed.sql
--- 12 runs after the seed: audit coverage, append-only logs, least-privilege grants
+-- 12 runs after the seed: audit coverage, append-only logs, least-privilege grants.
+-- It must run AFTER 13, because it grants SELECT on the migration ledger.
 \ir 12_security.sql
 COMMIT;

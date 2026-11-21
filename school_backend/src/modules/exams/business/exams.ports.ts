@@ -99,6 +99,8 @@ export interface ExamsRepository {
   loadResultInputs(examId: number, sectionId: number | null): Promise<ResultInputRow[]>;
   saveResults(examId: number, results: ProcessedResult[], tx: Tx): Promise<void>;
   setPublished(examId: number, published: boolean, tx: Tx): Promise<void>;
+  setWithheld(examId: number, enrollmentIds: number[] | null, withheld: boolean, tx: Tx): Promise<number[]>;
+  enrollmentIdsForSection(academicYearId: number, sectionId: number): Promise<number[]>;
   listResults(examId: number, sectionId?: number): Promise<Record<string, unknown>[]>;
   reportCard(examId: number, studentId: number): Promise<Record<string, unknown> | null>;
   /** One row per exam the student has a processed result for; publishedOnly hides unpublished exams. */

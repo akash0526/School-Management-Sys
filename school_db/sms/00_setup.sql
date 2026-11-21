@@ -12,7 +12,7 @@ CREATE EXTENSION IF NOT EXISTS btree_gist; -- exclusion constraints (no overlapp
 -- ---------------------------------------------------------------------
 -- Auto-update "updated_at" on every UPDATE.
 -- Attached automatically to every table with an updated_at column
--- by the DO-block in 99_triggers.sql.
+-- by the DO-block in 98_triggers.sql.
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS trigger AS $$

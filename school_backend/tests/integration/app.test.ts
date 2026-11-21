@@ -1,5 +1,5 @@
 import request from 'supertest';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
 import { loadEnv } from '../../src/config/env.js';
 import { buildContainer } from '../../src/container.js';
@@ -14,8 +14,29 @@ const container = buildContainer(env, createLogger('silent', false));
 const app = createApp(container);
 afterAll(() => container.core.db.close());
 
+/**
+ * Three assertions below need a live PostgreSQL (they check /health's real DB probe and
+ * look up a session that must not exist). On a machine without a database they would
+ * fail for an unrelated reason, which trains people to ignore a red suite. Skip them
+ * explicitly instead, so the message says what is missing.
+ */
+let dbUp = false;
+beforeAll(async () => {
+  try {
+    await container.core.db.query('SELECT 1');
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+});
+const itWithDb = (name: string, fn: () => Promise<void>) =>
+  it(name, async (ctx) => {
+    if (!dbUp) ctx.skip();          // reported as "skipped", never as a pass
+    await fn();
+  });
+
 describe('app shell', () => {
-  it('GET /health reports DB status', async () => {
+  itWithDb('GET /health reports DB status', async () => {
     const r = await request(app).get('/health');
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ status: 'ok', db: 'up' });
@@ -61,7 +82,7 @@ describe('app shell', () => {
     expect(r.body.error.details.map((d: any) => d.path)).toEqual(expect.arrayContaining(['username', 'password']));
   });
 
-  it('protected routes need a token; public routes need an API key', async () => {
+  itWithDb('protected routes need a token; public routes need an API key', async () => {
     expect((await request(app).get('/api/v1/students')).status).toBe(401);
     expect((await request(app).get('/api/v1/fees/invoices')).status).toBe(401);
     expect((await request(app).get('/api/v1/public/notices')).status).toBe(401);
@@ -81,7 +102,7 @@ describe('security hardening', () => {
     staffId: null, studentId: null, guardianId: null, mustChangePassword: false,
   };
 
-  it('a correctly signed token for a session that does not exist is rejected (logout/revocation is real)', async () => {
+  itWithDb('a correctly signed token for a session that does not exist is rejected (logout/revocation is real)', async () => {
     const t = tokens.signAccessToken({ ...superAdmin, sessionId: randomUUID() });
     const r = await request(app).get('/api/v1/users').set('Authorization', `Bearer ${t}`);
     expect(r.status).toBe(401);

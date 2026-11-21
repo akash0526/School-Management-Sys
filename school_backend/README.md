@@ -6,7 +6,7 @@ Single school, Nepal context (NEB grading, BS calendar, eSewa/Khalti).
 ```
 ✔ 83 source files · 9 modules · typecheck clean
 ✔ 49 unit + integration tests   (npm test)
-✔ 103-step end-to-end workflow  (npm run test:e2e)
+✔ 154-check end-to-end workflow  (npm run test:e2e)
 ```
 
 ---
@@ -128,7 +128,7 @@ Auth: `Authorization: Bearer <accessToken>` except `/public/*` (API key) and `/a
 
 **attendance** — `PUT/GET /attendance/sections/:sectionId` (bulk mark / roster) · `GET /attendance/students/:studentId[?from&to]` · `GET /attendance/students/:studentId/summary` · `PUT/GET /attendance/staff`
 
-**exams** — `GET/POST /exams` · `GET/PATCH /exams/:id` · `GET/POST /exams/:id/schedules` (with components TH/IN/PR) · `GET/PUT /exams/components/:componentId/marks` · `GET /exams/students/:studentId/results` (exam history; parents/students: own, published only) · `POST /exams/:id/verify` · `POST /exams/:id/process` · `POST /exams/:id/publish` · `GET /exams/:id/results` · `GET /exams/:id/report-cards/:studentId`
+**exams** — `GET/POST /exams` · `GET/PATCH /exams/:id` · `GET/POST /exams/:id/schedules` (with components TH/IN/PR) · `GET/PUT /exams/components/:componentId/marks` · `GET /exams/students/:studentId/results` (exam history; parents/students: own, published only) · `POST /exams/:id/verify` · `POST /exams/:id/process` · `POST /exams/:id/publish` · `POST /exams/:id/withhold` · `GET /exams/:id/results` · `GET /exams/:id/report-cards/:studentId`
 
 **fees** — `GET/POST /fees/types` · `GET/POST /fees/structures` · `GET/POST /fees/discounts` · `POST /fees/invoices/generate` · `GET /fees/invoices` · `GET /fees/invoices/:id` · `POST /fees/invoices/:id/cancel` · `POST /fees/receipts` · `GET /fees/receipts/:id` · `POST /fees/receipts/:id/cancel` · `GET /fees/students/:studentId/statement` · `GET /fees/students/:studentId/invoices` · `GET /fees/summary` (fees.view — outstanding, overdue, collected today / last 30 days)
 
@@ -141,8 +141,12 @@ Auth: `Authorization: Bearer <accessToken>` except `/public/*` (API key) and `/a
 ### Key business rules
 - **Attendance**: no future dates; holidays need `attendance.mark_any` + `allowHoliday`; teachers mark only sections they teach / class-teach; re-marking updates (upsert).
 - **Marks**: `marks.enter` = only your assigned subject+section; editing clears verification; locked after publish.
-- **Results**: NEB letter grading — each component graded separately; < pass marks (35% theory) = NG; GPA = Σ(credit hrs × GP) / Σ credit hrs; any NG/ABS ⇒ no GPA; ranks 1, 2, 2, 4. Processing refuses if marks are missing (unless `force` → treated absent). Parents/students see report cards only after publish; withheld results are hidden.
-- **Fees**: invoice numbers from `invoice_no_seq` (`INV-2083-000001`); bulk generation is atomic and idempotent per billing period; discounts (percent/fixed, per fee type or all) applied per line; stream-specific fees override general ones; payments auto-allocate oldest-first, remainder kept as advance credit; explicit allocations may name each invoice only once; digital payments need a reference no.; cancelling a receipt reverses the ledger.
+- **Results**: NEB letter grading — each component graded separately; < pass marks (35% theory) = NG; GPA = Σ(credit hrs × GP) / Σ credit hrs; any NG/ABS ⇒ no GPA; ranks 1, 2, 2, 4. Processing refuses if marks are missing (unless `force` → treated absent).
+- **Dates**: every "today" is the date in Nepal (`todayInNepal()`), never the UTC date — at 00:00–05:45 local the UTC date is still yesterday. Dates are compared as `YYYY-MM-DD` strings, never as `Date` objects, because `new Date('2026-11-22')` means UTC midnight (05:45 in Kathmandu). A date of birth must be before the admission date and never in the future; this is checked on **both** create and update, since moving an admission date earlier can invalidate an existing dob.
+- **Money**: a single `round2()` in `shared/money.ts` rounds every money and percentage step, and it is **symmetric about zero** — `Math.round` sends .5 towards +Infinity, so a charge of 1.005 and its exact reversal would not cancel. Balances can be negative (advance credit), so this matters.
+- **Withheld results** (`results.publish`): `POST /exams/:id/withhold -- {withheld, enrollmentIds|sectionId}`. For unpaid fees or a discipline case. The family sees "result withheld" and the subjects sat, with **every number hidden** (marks, percentage, GPA, grade, rank). Withholding is allowed after publishing, and **re-processing an exam keeps it** — a recompute must never quietly release a withheld result. Releasing restores the computed status (`graded` / `not_graded` / `absent`).
+- **Grading scale**: the bands must cover 0–100 with no gaps (the top band ends at 100.01 because ranges are exclusive). A gap is rejected with a 400 naming the uncovered range *before* any marks are processed, instead of failing halfway through the school with a 500.
+- **Fees**: invoice numbers from `invoice_no_seq` (`INV-2083-000001`); bulk generation is atomic and idempotent per billing period, and **set-based** — one sequence reservation, one invoice insert, one items insert and one ledger insert for the whole run instead of ~5 round-trips per student (billing 600 students: 1.6 s → 0.8 s, and on a network link the gap is much wider because each statement is an RTT). Invoice totals are read back *after* the line items exist, because a trigger computes them; discounts (percent/fixed, per fee type or all) applied per line; stream-specific fees override general ones; payments auto-allocate oldest-first, remainder kept as advance credit; explicit allocations may name each invoice only once; digital payments need a reference no.; cancelling a receipt reverses the ledger.
 
 ---
 
@@ -173,6 +177,27 @@ npm run dev                     # http://0.0.0.0:4000
 npm run build && npm start
 ```
 
+### Upgrading a live school
+
+`db:reset` and `db:demo` DESTROY the database — they are for new installs and demos only.
+A school that is already running is upgraded with migrations:
+
+```bash
+npm run db:migrate:status                    # applied vs pending
+npm run db:migrate -- --backup --dry-run     # plan + a pg_dump, change nothing
+npm run db:migrate -- --backup               # apply
+```
+
+- One transaction per file: a failure rolls back completely, so a half-migrated schema
+  cannot happen. An advisory lock stops two deploys migrating at once.
+- Applied migrations are never re-run; their checksum is compared instead, so editing a
+  shipped migration is an error rather than a silent divergence.
+- A migration that needs a judgement call (e.g. duplicate invoices before a new unique
+  index) prints what it found and refuses to proceed until you decide. It never guesses.
+- `--force-run` replays applied migrations to prove they are idempotent (CI does this).
+- The API logs a warning at startup if the database is behind the code, so a forgotten
+  migration surfaces at deploy time instead of as a 500 in front of a parent.
+
 ### Demo school or empty school (switchable)
 
 Both commands **delete the whole `school_sms` database** and rebuild it (they ask for confirmation; `--yes` skips it).
@@ -198,17 +223,30 @@ PSQL="sudo -u postgres psql" npm run db:reset -- --yes --admin-user admin --admi
 
 ### Tests
 ```bash
-npm test            # 114 tests: unit (NEB grading, fees, school profile & logo validation, password policy, anti-escalation, leavers, session gate, startup checks, DB-error mapping)
+npm test            # 175 tests: unit (NEB grading, fees, invoice batching, public API-key auth, money rounding, dob rules, school profile & logo validation, password policy, anti-escalation, leavers, session gate, startup checks, DB-error mapping)
                     # + integration (headers, CORS, CSRF origin check, forged/revoked/legacy tokens, huge-array DoS)
+                    # works on a fresh clone; the 3 database-backed checks skip (not fail) when no DB is reachable
+npm run db:test     # database rules: 42 must-be-rejected statements + trigger-computed invoice/grade checks
+npm run db:retention        # audit-log retention, dry run (add -- --apply to purge; see school_db/README.md)
+                    # creates and drops its own throwaway database — safe to run any time
+npm run db:migrate:status   # is this database behind the code?
+npm run db:migrate          # upgrade a LIVE school without losing data (see school_db/README.md)
 npm run test:e2e    # needs running server: API_URL, ADMIN_USER, ADMIN_PASS, API_KEY env vars
                     # it adds test records — run it on an empty DB (npm run db:reset), not on real data
 npm run typecheck
 ```
 
+`npm run db:test` is the one that protects the money. The schema is the last line of defence:
+a duplicated invoice, an overpaid receipt, a mark above full marks, a mark for a subject the
+student does not take, two overlapping academic years, or an edited audit log must all be
+impossible even if a service has a bug. The suite asserts each of those, and it asserts them
+by *failing* — a statement that is unexpectedly accepted is reported by name and the run exits
+non-zero. Add an assertion whenever you add a rule.
+
 The e2e script walks a whole term: setup → staff → students/guardians → enrollment → teacher & parent
 first login → attendance → exam, marks, results, report card → invoices, discounts, payments,
 cancellation → website API (notices, inquiries, results lookup, brute-force throttle) → refresh-token theft
-detection → immediate revocation (logout, admin reset, stolen token) → a teacher resigns and loses access — 124 checks, and checks every
+detection → immediate revocation (logout, admin reset, stolen token) → a teacher resigns and loses access — 154 checks, and checks every
 permission boundary on the way (teacher can't enter marks for other subjects, parent can't see other
 children, teacher can't collect fees, etc.).
 

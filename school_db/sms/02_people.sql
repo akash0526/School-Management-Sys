@@ -56,6 +56,9 @@ CREATE TABLE students (
     CHECK (left_date IS NULL OR left_date >= admission_date)
 );
 CREATE INDEX idx_students_name   ON students (last_name, first_name);
+-- the student list orders by first_name, last_name (see students.repository.list), so it needs
+-- its own index: (last_name, first_name) cannot serve that ordering and the list would sort every row
+CREATE INDEX idx_students_first_last ON students (first_name, last_name);
 CREATE INDEX idx_students_status ON students (status);
 
 -- ---------------------------------------------------------------------

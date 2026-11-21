@@ -44,6 +44,8 @@ CREATE TABLE events (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (end_at IS NULL OR end_at >= start_at)
 );
+-- the public events endpoint filters by date range and orders by start_at
+CREATE INDEX idx_events_start_at ON events (start_at);
 
 -- In-app / push notifications for portal users
 CREATE TABLE notifications (

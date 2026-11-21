@@ -10,6 +10,7 @@ export interface DomainEvents {
   'student.created': { studentId: number; actorUserId: number };
   'attendance.absent': { date: string; sectionId: number; enrollmentIds: number[]; actorUserId: number };
   'results.published': { examId: number; published: boolean; actorUserId: number };
+  'results.withheld': { examId: number; withheld: boolean; enrollmentIds: number[]; actorUserId: number };
   'receipt.created': { receiptId: number; studentId: number; amount: number; actorUserId: number };
   'receipt.cancelled': { receiptId: number; studentId: number; actorUserId: number };
   'inquiry.received': { inquiryId: number; source: string };

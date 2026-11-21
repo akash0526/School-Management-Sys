@@ -1,76 +1,377 @@
--- Run on a FRESH school_sms database: psql -d school_sms -f tests/test_constraints.sql
--- Part 1 must succeed; Part 2 lines must each print an ERROR (that mistake is blocked).
+-- =====================================================================
+-- DATABASE CONSTRAINT TESTS
+--
+-- The database is this system's primary enforcement layer: money, marks,
+-- academic-year consistency, one-current-year and log immutability are all
+-- blocked by constraints and triggers, not only by application code.
+-- This file proves each of those rules actually holds.
+--
+-- Run it:
+--     npm run db:test        (in school_backend/ — creates a throwaway DB, installs the
+--                             schema, runs every assertion and reports each one by name)
+-- or by hand against a database already built from sms/install.sql:
+--     psql -d school_sms_test -f tests/test_constraints.sql
+--     (Part 1 must succeed; every statement under "PART 2" must print ERROR)
+--
+-- DESIGN — why the file is shaped like this:
+--   Part 1 (SETUP)      statements that MUST succeed: legal school data, with
+--                       explicit ids so later assertions can name a row.
+--   Part 1b (STATE)     checks on values the triggers computed (invoice totals,
+--                       receipt cancellation, NG has no grade point, public views).
+--   Part 2 (MUST FAIL)  ONLY statements the schema must reject. Every one of
+--                       these has to error. If any of them is accepted, the rule
+--                       is not being enforced.
+--
+--   A prerequisite placed inside Part 2 would "pass" by failing, hiding a broken
+--   rule — that is exactly how this suite rotted before. Keep Part 2 pure.
+--
+--   Because the file asserts by failing, a plain `psql -f` run exits 0 no matter
+--   what happens. That is why the supported entry point is `npm run db:test`: it
+--   runs each assertion separately, reports the SQL error it got, and exits
+--   non-zero if any statement was accepted. Run it with --verbose to see the
+--   rejection reason for every assertion — that is how you check a test fails for
+--   the reason it claims rather than by accident.
+-- =====================================================================
+
 \set ON_ERROR_STOP on
--- ======================= SETUP (must all succeed) =======================
+\set QUIET on
+
+-- =====================================================================
+-- PART 1 — SETUP: must all succeed
+-- =====================================================================
+\echo '--- PART 1: setup (must succeed) ---'
 BEGIN;
 SET LOCAL app.user_id = '1';
-INSERT INTO users (username, password_hash) VALUES ('admin','x');
-INSERT INTO staff (employee_no, first_name, last_name, gender, phone, designation, staff_type, join_date, show_on_website)
- VALUES ('EMP001','Ram','Sharma','male','9800000000','Teacher','teaching','2020-01-01', true);
-INSERT INTO students (admission_no, first_name, last_name, gender, dob) VALUES ('ADM001','Sita','Thapa','female','2014-05-10'),('ADM002','Gita','Rai','female','2014-02-01');
-INSERT INTO sections (academic_year_id, class_id, name) VALUES (1,(SELECT id FROM classes WHERE numeric_level=10),'A');
-INSERT INTO sections (academic_year_id, class_id, name) VALUES (1,(SELECT id FROM classes WHERE numeric_level=9),'A');
-INSERT INTO subjects (code,name) VALUES ('MATH','Mathematics'),('OPTM','Opt Math'),('COMP','Computer');
-INSERT INTO class_subjects (academic_year_id,class_id,subject_id,credit_hours) VALUES (1,13,1,5);
-INSERT INTO class_subjects (academic_year_id,class_id,subject_id,is_optional,optional_group) VALUES (1,13,2,true,'Optional I'),(1,13,3,true,'Optional I');
-INSERT INTO enrollments (student_id, academic_year_id, section_id, roll_no, symbol_no) VALUES (1,1,1,1,'S123'),(2,1,2,1,'S124');
-INSERT INTO student_subjects VALUES (1,3);   -- Sita chose Computer
--- parallel optional subjects in same period now allowed
-INSERT INTO timetable_entries (academic_year_id,section_id,day_of_week,period_id,class_subject_id) VALUES (1,1,0,1,2),(1,1,0,1,3);
-INSERT INTO exams (academic_year_id, name, exam_type, is_published) VALUES (1,'First Terminal','terminal',true);
-INSERT INTO exam_schedules (exam_id, class_subject_id) VALUES (1,1),(1,3);
-INSERT INTO assessment_components (exam_schedule_id,name,component_type,full_marks,pass_marks,credit_hours)
- VALUES (1,'Theory','theory',75,26.25,3.75),(1,'Internal','internal',25,8.75,1.25),(2,'Theory','theory',50,17.5,2);
-INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (1,1,68),(2,1,22),(3,1,40);
-INSERT INTO marks (component_id, enrollment_id, is_absent) VALUES (2,1,true) ON CONFLICT DO NOTHING;
-INSERT INTO exam_results (exam_id, enrollment_id, gpa, final_grade, result_status) VALUES (1,1,4.0,'A+','graded');
--- fees
-INSERT INTO invoices (invoice_no, enrollment_id) VALUES ('INV-1',1);
-INSERT INTO invoice_items (invoice_id, fee_type_id, amount, discount) VALUES (1,2,3000,500),(1,3,1000,0);
-INSERT INTO receipts (receipt_no, student_id, amount, method) VALUES ('RCPT-1',1,2000,'esewa');
-INSERT INTO payment_allocations VALUES (1,1,2000);
-INSERT INTO notices (title, body, is_public) VALUES ('Dashain Holiday','School closed', true);
+
+-- Every primary key is GENERATED ALWAYS AS IDENTITY. This file needs deterministic ids
+-- (assertions name rows), so relax the mode for this throwaway database only.
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'users','staff','students','sections','rooms','subjects','class_subjects','enrollments',
+        'teacher_assignments','exams','exam_schedules','assessment_components','marks',
+        'invoices','receipts','books','book_copies','book_issues','academic_years','security_events',
+        'guardians'
+    ] LOOP
+        EXECUTE format('ALTER TABLE %I ALTER COLUMN id SET GENERATED BY DEFAULT', t);
+    END LOOP;
+END $$;
+
+-- Only one current academic year may exist, and years may not overlap (the seed
+-- already supplies '2083' as the current year).
+INSERT INTO users (id, username, password_hash) VALUES (1, 'c_admin', 'x');
+INSERT INTO staff (id, employee_no, first_name, last_name, gender, phone, designation, staff_type, join_date, show_on_website)
+  VALUES (1, 'EMP001', 'Ram', 'Sharma', 'male', '9800000000', 'Teacher', 'teaching', '2020-01-01', true),
+         (2, 'EMP002', 'Sita', 'Karki', 'female', '9800000001', 'Teacher', 'teaching', '2021-01-01', false);
+INSERT INTO students (id, admission_no, first_name, last_name, gender, dob)
+  VALUES (1, 'ADM001', 'Sita', 'Thapa', 'female', '2014-05-10'),
+         (2, 'ADM002', 'Gita', 'Rai',   'female', '2014-02-01');
+
+-- Grade 10-A (current year) with compulsory Maths and an optional group
+INSERT INTO sections (id, academic_year_id, class_id, name)
+  VALUES (1, 1, (SELECT id FROM classes WHERE numeric_level = 10), 'A'),
+         (2, 1, (SELECT id FROM classes WHERE numeric_level =  9), 'A');
+INSERT INTO rooms (id, name) VALUES (1, 'Room 10A');
+INSERT INTO subjects (id, code, name) VALUES (1, 'MATH', 'Mathematics'), (2, 'OPTM', 'Opt Math'), (3, 'COMP', 'Computer');
+INSERT INTO class_subjects (id, academic_year_id, class_id, subject_id, credit_hours)
+  VALUES (1, 1, (SELECT id FROM classes WHERE numeric_level = 10), 1, 5);
+INSERT INTO class_subjects (id, academic_year_id, class_id, subject_id, is_optional, optional_group)
+  VALUES (2, 1, (SELECT id FROM classes WHERE numeric_level = 10), 2, true, 'Optional I'),
+         (3, 1, (SELECT id FROM classes WHERE numeric_level = 10), 3, true, 'Optional I');
+
+-- BOTH students are in Grade 10-A this year, so the marks/optional-subject
+-- assertions in Part 2 fail for their intended reason, never for a class mismatch.
+INSERT INTO enrollments (id, student_id, academic_year_id, section_id, roll_no, symbol_no)
+  VALUES (1, 1, 1, 1, 1, 'S123'), (2, 2, 1, 1, 2, 'S124');
+INSERT INTO student_subjects VALUES (1, 3);                    -- Sita chose Computer
+
+-- Two optional subjects running in parallel are allowed on purpose;
+-- teacher and room clashes are still blocked (asserted in Part 2).
+-- Grade 9-A also has a Maths subject, used to prove teacher/room clashes across sections
+INSERT INTO class_subjects (id, academic_year_id, class_id, subject_id, is_optional, optional_group)
+  VALUES (4, 1, (SELECT id FROM classes WHERE numeric_level = 9), 1, true, 'Grade 9 Optional');
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, staff_id, room_id)
+  VALUES (1, 1, 0, 1, 2, 1, 1), (1, 1, 0, 1, 3, 2, NULL);
+-- an independent slot that holds Room 10A, so Part 2 can prove the room-clash rule
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, staff_id, room_id)
+  VALUES (1, 2, 0, 3, 4, 2, 1);
+
+INSERT INTO teacher_assignments (id, academic_year_id, section_id, class_subject_id, staff_id) VALUES (1, 1, 1, 1, 1);
+
+INSERT INTO exams (id, academic_year_id, name, exam_type, is_published) VALUES (1, 1, 'First Terminal', 'terminal', true);
+INSERT INTO exam_schedules (id, exam_id, class_subject_id) VALUES (1, 1, 1), (2, 1, 3);
+INSERT INTO assessment_components (id, exam_schedule_id, name, component_type, full_marks, pass_marks, credit_hours)
+  VALUES (1, 1, 'Theory',   'theory',   75, 26.25, 3.75),
+         (2, 1, 'Internal', 'internal', 25,  8.75, 1.25),
+         (3, 2, 'Theory',   'theory',   50, 17.50, 2);
+INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (1, 1, 68), (3, 1, 40);
+INSERT INTO marks (component_id, enrollment_id, is_absent) VALUES (2, 1, true);
+INSERT INTO exam_results (exam_id, enrollment_id, gpa, final_grade, result_status) VALUES (1, 1, 4.0, 'A+', 'graded');
+
+-- a later academic year, used to prove cross-year rows are rejected
+INSERT INTO academic_years (id, name, start_date, end_date) VALUES (2, '2084', '2027-04-14', '2028-04-13');
+
+-- fees: a 2-line invoice paid by two receipts (the second is cancelled below)
+INSERT INTO invoices (id, invoice_no, enrollment_id, billing_period) VALUES (1, 'INV-1', 1, '2083-Baisakh');
+INSERT INTO invoice_items (invoice_id, fee_type_id, amount, discount) VALUES (1, 2, 3000, 500), (1, 3, 1000, 0);
+INSERT INTO receipts (id, receipt_no, student_id, amount, method)
+  VALUES (1, 'RCPT-1', 1, 2000, 'esewa'),
+         (2, 'RCPT-2', 1, 1500, 'cash'),   -- cancelled in Part 1b
+         (3, 'RCPT-3', 1, 9000, 'cash'),   -- unallocated: used to prove overpayment is blocked
+         (4, 'RCPT-4', 2, 100,  'cash');   -- unallocated: used to prove over-allocation is blocked
+INSERT INTO payment_allocations VALUES (1, 1, 2000), (2, 1, 1500);
+INSERT INTO notices (title, body, is_public) VALUES ('Dashain Holiday', 'School closed', true);
+
+-- a security event, so the append-only rule in Part 2 has a row to act on
+-- (a trigger only fires on rows actually touched; deleting from an empty table proves nothing)
+INSERT INTO security_events (id, event_type, severity, username) VALUES (1, 'login_success', 'info', 'c_admin');
+
+-- guardians: one primary, one secondary (Part 2 proves only one can be primary)
+INSERT INTO guardians (id, full_name, phone) VALUES (1, 'Hari Thapa', '9811111111'), (2, 'Mina Thapa', '9822222222'), (3, 'Bikash Thapa', '9833333333');
+INSERT INTO student_guardians (student_id, guardian_id, relation, is_primary) VALUES (1, 1, 'father', true), (1, 2, 'mother', false);
+
+-- a fourth student with no enrollment yet: lets Part 2 prove symbol-number uniqueness
+-- by enrolling them with a symbol that is already taken
+INSERT INTO students (id, admission_no, first_name, last_name, gender, dob) VALUES (4, 'ADM004', 'Puja', 'Gurung', 'female', '2009-03-03');
+
+-- a third student in Grade 9, with a distinct board symbol number
+INSERT INTO students (id, admission_no, first_name, last_name, gender, dob) VALUES (3, 'ADM003', 'Nabin', 'Shrestha', 'male', '2013-08-20');
+INSERT INTO enrollments (id, student_id, academic_year_id, section_id, roll_no, symbol_no) VALUES (3, 3, 1, 2, 1, 'S125');
+
+-- ledger rows: charges (debit) and payments (credit)
+INSERT INTO student_ledger (student_id, enrollment_id, entry_type, invoice_id, debit) VALUES (1, 1, 'charge', 1, 3500);
+INSERT INTO student_ledger (student_id, enrollment_id, entry_type, receipt_id, credit) VALUES (1, 1, 'payment', 1, 2000);
+
+-- library: one copy, currently issued
+INSERT INTO books (id, title, author) VALUES (1, 'Maths 10', 'CDC');
+INSERT INTO book_copies (id, book_id, accession_no) VALUES (1, 1, 'ACC001');
+INSERT INTO book_issues (id, book_copy_id, student_id, issue_date, due_date) VALUES (1, 1, 1, '2026-05-01', '2026-05-15');
+
+-- Explicit ids above did not advance the identity sequences, so the next automatic
+-- id would be 1 and every Part 2 assertion would fail on a primary-key collision
+-- instead of on its own rule. Move each sequence past the rows we inserted.
+DO $$
+DECLARE r RECORD; seq TEXT;
+BEGIN
+    FOR r IN SELECT c.relname AS tbl
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind = 'r'
+               AND EXISTS (SELECT 1 FROM pg_attribute a
+                           WHERE a.attrelid = c.oid AND a.attname = 'id' AND a.attnum > 0)
+    LOOP
+        seq := pg_get_serial_sequence('public.' || quote_ident(r.tbl), 'id');
+        IF seq IS NOT NULL THEN
+            EXECUTE format('SELECT setval(%L, GREATEST(COALESCE((SELECT max(id) FROM %I), 0), 1))', seq, r.tbl);
+        END IF;
+    END LOOP;
+END $$;
 COMMIT;
+\echo 'SETUP: OK'
 
-\echo '=== invoice after items + partial payment (expect 4000/500/3500/2000/partial)'
-SELECT subtotal, discount_total, total_amount, paid_amount, status FROM invoices WHERE id=1;
-INSERT INTO receipts (receipt_no, student_id, amount, method) VALUES ('RCPT-2',1,1500,'cash');
-INSERT INTO payment_allocations VALUES (2,1,1500);
-\echo '=== after second payment (expect paid)'
-SELECT total_amount, paid_amount, status FROM invoices WHERE id=1;
-UPDATE receipts SET status='cancelled', cancel_reason='bounced' WHERE id=2;
-\echo '=== after cancelling receipt 2 (expect 2000 / partial)'
-SELECT paid_amount, status FROM invoices WHERE id=1;
-\echo '=== NG grade has NULL grade point'
-SELECT grade, grade_point FROM grading_scale_items WHERE grade IN ('A+','D','NG') ORDER BY min_percent DESC;
-\echo '=== public_results'
-SELECT exam_name, student_name, gpa, final_grade, result_status FROM public_results WHERE symbol_no='S123' AND dob='2014-05-10';
+-- =====================================================================
+-- PART 1b — STATE: values the triggers must have computed
+-- =====================================================================
+\echo '--- PART 1b: trigger-computed state ---'
+BEGIN;
+DO $$
+DECLARE v RECORD;
+BEGIN
+    SELECT subtotal, discount_total, total_amount, paid_amount, status INTO v FROM invoices WHERE id = 1;
+    IF v.subtotal <> 4000 OR v.discount_total <> 500 OR v.total_amount <> 3500 THEN
+        RAISE EXCEPTION 'invoice totals wrong: subtotal %, discount %, total %', v.subtotal, v.discount_total, v.total_amount;
+    END IF;
+    IF v.paid_amount <> 3500 OR v.status <> 'paid' THEN
+        RAISE EXCEPTION 'invoice payment state wrong after two receipts: paid %, status %', v.paid_amount, v.status;
+    END IF;
+    IF (SELECT grade_point FROM grading_scale_items WHERE grade = 'NG') IS NOT NULL THEN
+        RAISE EXCEPTION 'NG must have no grade point';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public_results WHERE symbol_no = 'S123' AND dob = '2014-05-10') THEN
+        RAISE EXCEPTION 'public_results view did not expose a published result';
+    END IF;
+END $$;
 
--- ======================= MUST FAIL =======================
+-- cancelling a receipt must hand the money back to the invoice it paid
+UPDATE receipts SET status = 'cancelled', cancel_reason = 'bounced' WHERE id = 2;
+DO $$
+DECLARE v RECORD;
+BEGIN
+    SELECT paid_amount, status INTO v FROM invoices WHERE id = 1;
+    IF v.paid_amount <> 2000 OR v.status <> 'partial' THEN
+        RAISE EXCEPTION 'cancelling a receipt did not reverse its allocation: paid %, status %', v.paid_amount, v.status;
+    END IF;
+END $$;
+
+-- audit + security logs are append-only
+DO $$
+BEGIN
+    BEGIN
+        UPDATE audit_logs SET action = 'DELETE' WHERE id = (SELECT min(id) FROM audit_logs);
+        RAISE EXCEPTION 'audit_logs accepted an UPDATE — it must be append-only';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE '%accepted%' THEN RAISE; END IF;  -- ours = a real failure; anything else = correctly blocked
+    END;
+END $$;
+-- ---------------------------------------------------------------------
+-- Schema objects the application depends on (migrations 0005 / 0006).
+-- A missing index does not break any query — it just quietly makes every
+-- call slower as the school grows — so nothing else in the pipeline would
+-- ever notice it disappearing.
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    missing TEXT;
+BEGIN
+    SELECT string_agg(n, ', ') INTO missing
+      FROM (VALUES ('idx_students_first_last'), ('idx_invoice_items_invoice'), ('idx_events_start_at')) AS want(n)
+     WHERE to_regclass('public.' || n) IS NULL;
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION 'missing query-path index(es): %', missing;
+    END IF;
+END $$;
+
+-- The retention purge exists and refuses to be run by a caller that cannot
+-- delete audit history. The window itself must be configured.
+DO $$
+DECLARE v INT;
+BEGIN
+    IF to_regprocedure('public.purge_audit_logs(integer, boolean)') IS NULL THEN
+        RAISE EXCEPTION 'purge_audit_logs(integer, boolean) is missing — audit_logs has no retention policy';
+    END IF;
+    SELECT (value #>> '{}')::INT INTO v FROM settings WHERE key = 'audit_log_retention_days';
+    IF v IS NULL OR v < 30 THEN
+        RAISE EXCEPTION 'audit_log_retention_days is missing or below the 30-day floor (got %)', v;
+    END IF;
+END $$;
+
+-- A dry run of an explicit window must both (a) report that window's rows and
+-- (b) delete nothing. Keying the dry run off "p_days IS NULL" made
+-- purge_audit_logs(30) silently use the configured 730-day window instead.
+DO $$
+DECLARE
+    v_reported BIGINT;
+    v_actual   BIGINT;
+    v_rows     BIGINT;
+BEGIN
+    INSERT INTO audit_logs (action, table_name, record_id, created_at)
+    VALUES ('INSERT', 'retention_probe', 'old',  now() - interval '400 days'),
+           ('INSERT', 'retention_probe', 'new',  now() - interval '10 days');
+    SELECT count(*) INTO v_rows FROM audit_logs WHERE table_name = 'retention_probe';
+
+    -- preview 365: the 400-day-old row qualifies, the 10-day-old one does not
+    v_reported := purge_audit_logs(365, true);
+    IF v_reported <> 1 THEN
+        RAISE EXCEPTION 'dry run of a 365-day window reported % eligible rows, expected 1', v_reported;
+    END IF;
+    SELECT count(*) INTO v_actual FROM audit_logs WHERE table_name = 'retention_probe';
+    IF v_actual <> v_rows THEN
+        RAISE EXCEPTION 'a dry run deleted rows (% before, % after)', v_rows, v_actual;
+    END IF;
+
+    -- and an actual purge of that window removes exactly the one row
+    v_actual := purge_audit_logs(365, false);
+    IF v_actual <> 1 THEN
+        RAISE EXCEPTION 'purging a 365-day window deleted % rows, expected 1', v_actual;
+    END IF;
+    IF EXISTS (SELECT 1 FROM audit_logs WHERE table_name = 'retention_probe' AND record_id = 'new') IS NOT TRUE THEN
+        RAISE EXCEPTION 'purging a 365-day window also deleted the 10-day-old row';
+    END IF;
+END $$;
+
+-- The append-only guard must stand aside for the retention job and for NOTHING else.
+-- Here that means: a DELETE inside this transaction with the flag set succeeds.
+DO $$
+DECLARE v_id BIGINT;
+BEGIN
+    INSERT INTO audit_logs (action, table_name, record_id) VALUES ('INSERT', 'retention_probe', 'x') RETURNING id INTO v_id;
+    PERFORM set_config('app.audit_retention', 'on', true);
+    DELETE FROM audit_logs WHERE id = v_id;
+    PERFORM set_config('app.audit_retention', '', true);
+    IF EXISTS (SELECT 1 FROM audit_logs WHERE id = v_id) THEN
+        RAISE EXCEPTION 'audit retention flag did not allow a declared purge';
+    END IF;
+END $$;
+
+COMMIT;
+\echo 'STATE: OK'
+
+-- =====================================================================
+-- PART 2 — MUST FAIL: every statement below is a mistake the schema blocks.
+--
+-- Nothing here may succeed. No prerequisites, no "control" rows: anything that
+-- passes is a rule that is NOT enforced, and `npm run db:test` will name it
+-- using the `-- expect:` label on the line.
+-- =====================================================================
 \set ON_ERROR_STOP off
-\echo '=== EXPECTED ERRORS BELOW (each line = one blocked mistake)'
-INSERT INTO academic_years (name,start_date,end_date) VALUES ('BAD','2026-06-01','2027-06-01');
-INSERT INTO marks (component_id, enrollment_id, marks_obtained, is_absent) VALUES (1,2,5,true);
-INSERT INTO marks (component_id, enrollment_id) VALUES (1,2);
-INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (1,1,80) ON CONFLICT (component_id, enrollment_id) DO UPDATE SET marks_obtained=80;
-INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (1,2,50);
-INSERT INTO exam_schedules (exam_id, class_subject_id) VALUES (1,2);
-INSERT INTO assessment_components (exam_schedule_id,name,component_type,full_marks) VALUES (3,'Theory','theory',75);
-INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (4,1,50);
-INSERT INTO student_subjects VALUES (2,2);
-INSERT INTO grading_scale_items (grading_scale_id,min_percent,max_percent,grade,grade_point) VALUES (1,85,95,'X',3.9);
-INSERT INTO invoices (invoice_no, enrollment_id) VALUES ('INV-2',1);
-INSERT INTO invoice_items (invoice_id, fee_type_id, amount) VALUES (2,2,5000);
-INSERT INTO payment_allocations VALUES (1,2,100);
-INSERT INTO invoices (invoice_no, enrollment_id) VALUES ('INV-3',2);
-INSERT INTO invoice_items (invoice_id, fee_type_id, amount) VALUES (3,2,5000);
-INSERT INTO receipts (receipt_no, student_id, amount, method) VALUES ('RCPT-3',1,9000,'cash');
-INSERT INTO payment_allocations VALUES (3,3,100);
-INSERT INTO payment_allocations VALUES (2,2,100);
-INSERT INTO payment_allocations VALUES (3,1,1600);
-INSERT INTO teacher_assignments (academic_year_id, section_id, class_subject_id, staff_id)
-  VALUES ((SELECT id FROM academic_years WHERE NOT is_current LIMIT 1),1,1,1);
-INSERT INTO academic_years (name,start_date,end_date) VALUES ('2084','2027-04-14','2028-04-13');
-INSERT INTO teacher_assignments (academic_year_id, section_id, class_subject_id, staff_id) VALUES ((SELECT id FROM academic_years WHERE name='2084'),1,1,1);
-INSERT INTO enrollments (student_id, academic_year_id, section_id, roll_no, symbol_no) VALUES (2,(SELECT id FROM academic_years WHERE name='2084'),1,5,NULL);
-INSERT INTO book_issues (book_copy_id, student_id, issue_date, due_date) VALUES (1,1,'2026-05-10','2026-05-01');
+\echo '--- PART 2: must-fail assertions ---'
+
+-- ---- academic structure
+INSERT INTO academic_years (name, start_date, end_date) VALUES ('OVERLAP', '2026-06-01', '2027-06-01');  -- expect: academic years may not overlap
+INSERT INTO academic_years (name, start_date, end_date, is_current) VALUES ('SECOND', '2028-04-14', '2029-04-13', true);  -- expect: only one current academic year
+INSERT INTO academic_years (name, start_date, end_date) VALUES ('BACKWARDS', '2029-04-14', '2029-04-01');  -- expect: academic year end must be after start
+INSERT INTO sections (academic_year_id, class_id, name) VALUES (1, (SELECT id FROM classes WHERE numeric_level = 10), 'A');  -- expect: section name unique per year and class
+
+-- ---- timetable: parallel optional subjects were allowed in Part 1, clashes must not be.
+--      Each row here is legal on its own merits (valid period, subject and section) but
+--      duplicates a teacher or a room already booked in that slot.
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, staff_id) VALUES (1, 2, 0, 1, 4, 1);  -- expect: a teacher cannot be in two places at once
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, staff_id) VALUES (1, 1, 0, 3, 1, 2);  -- expect: teacher clash across sections (staff 2 already teaches section 2 then)
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, staff_id) VALUES (1, 2, 0, 1, 1, 2);  -- expect: another class cannot book the same teacher in that slot
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, room_id) VALUES (1, 1, 0, 3, 1, 1);  -- expect: a room cannot host two classes at once
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id, room_id) VALUES (1, 1, 0, 1, 1, 1);  -- expect: room double-booked by a parallel optional subject
+INSERT INTO timetable_entries (academic_year_id, section_id, day_of_week, period_id, class_subject_id) VALUES (1, 1, 0, 1, 2);  -- expect: the same subject cannot be scheduled twice in one slot
+
+-- ---- marks (both students are in the same class, section and year)
+INSERT INTO marks (component_id, enrollment_id, marks_obtained, is_absent) VALUES (1, 2, 5, true);  -- expect: absent students cannot have marks
+INSERT INTO marks (component_id, enrollment_id) VALUES (1, 2);  -- expect: a mark row must be marks or absent, not neither
+INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (1, 1, 80);  -- expect: marks cannot exceed full marks
+UPDATE marks SET marks_obtained = 5 WHERE component_id = 2 AND enrollment_id = 1;  -- expect: an absent student stays absent
+INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (3, 2, 40);  -- expect: marks only for a chosen optional subject
+INSERT INTO marks (component_id, enrollment_id, marks_obtained) VALUES (3, 1, 51);  -- expect: marks cannot exceed the optional paper full marks
+
+-- ---- exam structure
+INSERT INTO exam_schedules (exam_id, class_subject_id) VALUES (1, 1);  -- expect: one paper per subject per exam
+INSERT INTO assessment_components (exam_schedule_id, name, component_type, full_marks) VALUES (1, 'Theory', 'theory', 75);  -- expect: component names unique per paper
+INSERT INTO grading_scale_items (grading_scale_id, min_percent, max_percent, grade, grade_point) VALUES (1, 85, 95, 'X', 3.9);  -- expect: grade bands may not overlap
+INSERT INTO exams (academic_year_id, name, exam_type, start_date, end_date) VALUES (1, 'Bad Dates', 'unit', '2026-06-10', '2026-06-01');  -- expect: exam end date cannot be before start date
+
+-- ---- optional subjects and academic-year consistency
+INSERT INTO student_subjects VALUES (1, 1);  -- expect: a compulsory subject cannot be "chosen"
+INSERT INTO student_subjects VALUES (2, 4);  -- expect: a Grade 9 optional subject cannot be chosen by a Grade 10 student
+INSERT INTO student_subjects VALUES (1, 3);  -- expect: the same subject cannot be chosen twice (primary key)
+INSERT INTO teacher_assignments (academic_year_id, section_id, class_subject_id, staff_id) VALUES (2, 1, 1, 1);  -- expect: assignment section must belong to the assignment year
+INSERT INTO enrollments (student_id, academic_year_id, section_id, roll_no) VALUES (2, 2, 1, 5);  -- expect: enrollment section must belong to the same year
+INSERT INTO enrollments (student_id, academic_year_id, section_id, roll_no) VALUES (1, 1, 1, 9);  -- expect: one enrollment per student per year
+INSERT INTO enrollments (student_id, academic_year_id, section_id, roll_no) VALUES (4, 1, 1, 1);  -- expect: roll number unique within a section
+
+-- ---- fees
+INSERT INTO invoices (invoice_no, enrollment_id, billing_period) VALUES ('INV-2', 1, '2083-Baisakh');  -- expect: one live invoice per student per billing period
+INSERT INTO invoice_items (invoice_id, fee_type_id, amount, discount) VALUES (1, 2, 100, 200);  -- expect: line discount cannot exceed the line amount
+INSERT INTO payment_allocations VALUES (4, 1, 100);  -- expect: a receipt cannot pay another student's invoice
+INSERT INTO payment_allocations VALUES (3, 1, 1600);  -- expect: an invoice cannot be overpaid
+INSERT INTO payment_allocations VALUES (2, 1, 100);  -- expect: a cancelled receipt cannot allocate
+INSERT INTO payment_allocations VALUES (4, 2, 500);  -- expect: allocation cannot exceed the receipt amount
+
+-- student 4 (set up above, not enrolled) uses a free roll number and the
+-- already-used symbol S125, so the duplicate SYMBOL is the only possible rejection
+-- ---- board symbol numbers
+INSERT INTO enrollments (student_id, academic_year_id, section_id, roll_no, symbol_no) VALUES (4, 1, 2, 7, 'S125');  -- expect: a board symbol number cannot repeat within an academic year
+
+-- ---- guardians
+INSERT INTO student_guardians (student_id, guardian_id, relation, is_primary) VALUES (1, 3, 'uncle', true);  -- expect: one primary guardian per student (student 1 already has one)
+
+-- ---- ledger: a row is a debit OR a credit, never both, never neither
+INSERT INTO student_ledger (student_id, entry_type, debit, credit) VALUES (1, 'adjustment', 100, 50);  -- expect: a ledger row is either debit or credit, not both
+INSERT INTO student_ledger (student_id, entry_type, debit, credit) VALUES (1, 'adjustment', 0, 0);  -- expect: a ledger row needs a debit or a credit
+
+-- ---- dates and library
+INSERT INTO book_issues (book_copy_id, student_id, issue_date, due_date) VALUES (1, 1, '2026-05-10', '2026-05-01');  -- expect: library due date cannot be before issue date
+INSERT INTO book_issues (book_copy_id, student_id, issue_date, due_date) VALUES (1, 1, '2026-05-10', '2026-05-20');  -- expect: a copy cannot be issued twice at once
+
+-- ---- log immutability
+DELETE FROM audit_logs WHERE id = (SELECT min(id) FROM audit_logs);  -- expect: audit log is append-only
+DELETE FROM security_events WHERE event_type = 'login_success';  -- expect: security log is append-only
+
+-- the retention flag allows a DELETE, never a rewrite of history
+UPDATE audit_logs SET action = 'DELETE' WHERE id = (SELECT min(id) FROM audit_logs);  -- expect: the retention flag does not allow rewriting history

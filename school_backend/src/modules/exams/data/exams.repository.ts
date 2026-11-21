@@ -243,6 +243,18 @@ export class PgExamsRepository implements ExamsRepository {
 
   async saveResults(examId: number, results: ProcessedResult[], q: Queryable) {
     const ids = results.map((r) => r.enrollmentId);
+    // `withheld` is a decision an official made (unpaid fees, a discipline case), not a
+    // computed value, so re-processing must not silently release it. These rows are
+    // deleted and re-inserted below, so remember which ones were withheld.
+    const withheld = new Set(
+      (
+        await q.query<{ enrollment_id: string }>(
+          `SELECT enrollment_id FROM exam_results
+            WHERE exam_id = $1 AND enrollment_id = ANY($2::bigint[]) AND result_status = 'withheld'`,
+          [examId, ids],
+        )
+      ).rows.map((r) => Number(r.enrollment_id)),
+    );
     for (const table of ['exam_component_results', 'exam_subject_results', 'exam_results']) {
       await q.query(`DELETE FROM ${table} WHERE exam_id = $1 AND enrollment_id = ANY($2::bigint[])`, [examId, ids]);
     }
@@ -273,13 +285,69 @@ export class PgExamsRepository implements ExamsRepository {
                                                 percentage numeric, grade text, grade_point numeric, is_graded boolean)`,
       [examId, JSON.stringify(subjects)],
     );
+    // `withheld` is a decision an official made (unpaid fees, a discipline case), not a
+    // computed value. Re-processing an exam must keep it, so it is excluded from the
+    // update — otherwise a re-run would silently release a withheld result.
     await q.query(
       `INSERT INTO exam_results (exam_id, enrollment_id, total_obtained, total_full, percentage, gpa, final_grade, rank_in_section, rank_in_class, result_status)
        SELECT $1, x.enrollment_id, x.total_obtained, x.total_full, x.percentage, x.gpa, x.final_grade, x.rank_in_section, x.rank_in_class, x.result_status
          FROM jsonb_to_recordset($2::jsonb) AS x(enrollment_id bigint, total_obtained numeric, total_full numeric, percentage numeric, gpa numeric,
-                                                final_grade text, rank_in_section smallint, rank_in_class smallint, result_status text)`,
+                                                final_grade text, rank_in_section smallint, rank_in_class smallint, result_status text)
+       ON CONFLICT (exam_id, enrollment_id) DO UPDATE SET
+            total_obtained = EXCLUDED.total_obtained,
+            total_full     = EXCLUDED.total_full,
+            percentage     = EXCLUDED.percentage,
+            gpa            = EXCLUDED.gpa,
+            final_grade    = EXCLUDED.final_grade,
+            rank_in_section = EXCLUDED.rank_in_section,
+            rank_in_class   = EXCLUDED.rank_in_class,
+            result_status  = CASE WHEN exam_results.result_status = 'withheld'
+                                  THEN 'withheld' ELSE EXCLUDED.result_status END,
+            computed_at    = now()`,
       [examId, JSON.stringify(overall)],
     );
+    // re-apply the withhold decision that the DELETE above removed
+    if (withheld.size) {
+      await q.query(
+        `UPDATE exam_results SET result_status = 'withheld'
+          WHERE exam_id = $1 AND enrollment_id = ANY($2::bigint[])`,
+        [examId, [...withheld]],
+      );
+    }
+  }
+
+  /**
+   * Withhold or release results. Only rows that already have a computed result are
+   * affected, so an enrollment must have been processed first.
+   * Releasing restores the computed status ('graded' / 'not_graded' / 'absent') rather
+   * than assuming 'graded', because an absent student's result is not a graded one.
+   */
+  /** Enrollments of one section in a given academic year — used to withhold a whole class. */
+  async enrollmentIdsForSection(academicYearId: number, sectionId: number) {
+    const { rows } = await this.db.query<{ id: string }>(
+      `SELECT id FROM enrollments WHERE academic_year_id = $1 AND section_id = $2 ORDER BY id`,
+      [academicYearId, sectionId],
+    );
+    return rows.map((r) => Number(r.id));
+  }
+
+  async setWithheld(examId: number, enrollmentIds: number[] | null, withheld: boolean, q: Queryable) {
+    const { rows } = await q.query<{ enrollment_id: string }>(
+      `UPDATE exam_results
+          SET result_status = CASE
+                WHEN $3::boolean THEN 'withheld'
+                -- recompute from what was already calculated; never assume 'graded'
+                WHEN final_grade = 'ABS' THEN 'absent'
+                WHEN gpa IS NULL        THEN 'not_graded'
+                ELSE 'graded'
+              END
+        WHERE exam_id = $1
+          AND ($2::bigint[] IS NULL OR enrollment_id = ANY($2::bigint[]))
+          AND ($3::boolean OR result_status = 'withheld')
+        RETURNING enrollment_id`,
+      [examId, enrollmentIds, withheld],
+    );
+    return rows.map((r) => Number(r.enrollment_id));
   }
 
   async setPublished(examId: number, published: boolean, q: Queryable) {
@@ -290,7 +358,12 @@ export class PgExamsRepository implements ExamsRepository {
     const { rows } = await this.db.query(
       `SELECT r.enrollment_id, s.id AS student_id, s.admission_no, concat_ws(' ', s.first_name, s.middle_name, s.last_name) AS student_name,
               c.name AS class_name, sec.name AS section_name, e.roll_no,
-              r.total_obtained, r.total_full, r.percentage, r.gpa, r.final_grade, r.rank_in_section, r.rank_in_class, r.result_status
+              CASE WHEN r.result_status = 'withheld' THEN NULL ELSE r.total_obtained END AS total_obtained,
+              r.total_full,
+              CASE WHEN r.result_status = 'withheld' THEN NULL ELSE r.percentage END AS percentage,
+              CASE WHEN r.result_status = 'withheld' THEN NULL ELSE r.gpa END AS gpa,
+              CASE WHEN r.result_status = 'withheld' THEN NULL ELSE r.final_grade END AS final_grade,
+              r.rank_in_section, r.rank_in_class, r.result_status
          FROM exam_results r
          JOIN enrollments e ON e.id = r.enrollment_id
          JOIN students s ON s.id = e.student_id
@@ -323,9 +396,32 @@ export class PgExamsRepository implements ExamsRepository {
     if (!head.rows[0]) return null;
     const card = toCamel<Record<string, unknown> & { enrollmentId: number }>(head.rows[0]);
 
-    // withheld results show status only (e.g. unpaid fees)
+    // Withheld (e.g. unpaid fees): the family is told the result is withheld, and every
+    // NUMBER is hidden. The subject list is still returned so the card shows which
+    // subjects were sat — an empty page looks like a bug, not a decision.
     if (card.resultStatus === 'withheld') {
-      return { ...card, gpa: null, finalGrade: null, percentage: null, totalObtained: null, subjects: [] };
+      return {
+        ...card,
+        gpa: null,
+        finalGrade: null,
+        percentage: null,
+        totalObtained: null,
+        rankInSection: null,
+        rankInClass: null,
+        subjects: rowsToCamel(
+          (
+            await this.db.query(
+              `SELECT sr.class_subject_id, sub.code AS subject_code, sub.name AS subject_name, sr.total_full
+                 FROM exam_subject_results sr
+                 JOIN class_subjects cs ON cs.id = sr.class_subject_id
+                 JOIN subjects sub ON sub.id = cs.subject_id
+                WHERE sr.exam_id = $1 AND sr.enrollment_id = $2
+                ORDER BY cs.sequence, sub.name`,
+              [examId, card.enrollmentId],
+            )
+          ).rows,
+        ).map((sub) => ({ ...sub, totalObtained: null, percentage: null, grade: 'WITHHELD', gradePoint: null, isGraded: false, components: [] })),
+      };
     }
 
     const subjects = await this.db.query(

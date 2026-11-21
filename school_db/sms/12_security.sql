@@ -100,6 +100,15 @@ CREATE INDEX IF NOT EXISTS idx_security_events_target ON security_events (target
 CREATE OR REPLACE FUNCTION forbid_log_tampering()
 RETURNS trigger AS $$
 BEGIN
+    -- audit_logs has a retention policy (see 0006_audit_log_retention.sql). The guard
+    -- still refuses every ordinary DELETE; it only stands aside when the caller has
+    -- explicitly declared intent for this transaction. `IS NOT DISTINCT FROM` means an
+    -- unset / empty / NULL setting can never enable the bypass by accident.
+    IF TG_OP = 'DELETE'
+       AND TG_TABLE_NAME = 'audit_logs'
+       AND current_setting('app.audit_retention', TRUE) IS NOT DISTINCT FROM 'on' THEN
+        RETURN OLD;
+    END IF;
     RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
 END;
 $$ LANGUAGE plpgsql;
@@ -119,6 +128,66 @@ CREATE TRIGGER trg_security_events_no_truncate BEFORE TRUNCATE ON security_event
 FOR EACH STATEMENT EXECUTE FUNCTION forbid_log_tampering();
 
 -- ---------------------------------------------------------------------
+-- 4b. Retention for audit_logs (kept forever would grow without bound: a
+--     marking season writes an audit row per mark per component).
+--     security_events is deliberately NOT purged — those are authentication
+--     records, small in volume and the first thing an investigation needs.
+-- ---------------------------------------------------------------------
+INSERT INTO settings (key, value)
+VALUES ('audit_log_retention_days', '730'::jsonb)
+ON CONFLICT (key) DO NOTHING;
+
+-- The previous signature was purge_audit_logs(INT). CREATE OR REPLACE cannot replace a
+-- function whose argument list changed — it would ADD an overload, leaving a bare
+-- purge_audit_logs() ambiguous ("function is not unique") on an upgraded database.
+DROP FUNCTION IF EXISTS purge_audit_logs(INT);
+
+CREATE OR REPLACE FUNCTION purge_audit_logs(p_days INT DEFAULT NULL, p_dry_run BOOLEAN DEFAULT NULL)
+RETURNS BIGINT AS $$
+DECLARE
+    v_dry_run  BOOLEAN;
+    v_days     INT;
+    v_cutoff   TIMESTAMPTZ;
+    v_eligible BIGINT;
+    v_deleted  BIGINT := 0;
+BEGIN
+    -- No argument at all = preview the configured window. An explicit window with
+    -- p_dry_run unset = preview it. p_dry_run wins whenever it is given.
+    v_dry_run := COALESCE(p_dry_run, p_days IS NULL);
+    v_days := COALESCE(p_days, (SELECT (value #>> '{}')::INT FROM settings WHERE key = 'audit_log_retention_days'));
+    IF v_days IS NULL OR v_days <= 0 THEN
+        RAISE NOTICE 'audit retention is disabled (window = %); nothing purged', v_days;
+        RETURN 0;
+    END IF;
+    IF v_days < 30 THEN
+        RAISE EXCEPTION 'refusing to purge audit_logs with a % day window (minimum 30)', v_days;
+    END IF;
+
+    v_cutoff := now() - make_interval(days => v_days);
+    SELECT count(*) INTO v_eligible FROM audit_logs WHERE created_at < v_cutoff;
+
+    -- When the caller passes an explicit window they are previewing THAT window, so it
+    -- reports and stops. The guard is `v_dry_run`, not "p_days was NULL": keying the dry
+    -- run off the NULL check meant `purge_audit_logs(365)` silently used the CONFIGURED
+    -- window (730) for its count, and reported 8 eligible when 26 were.
+    IF v_dry_run THEN
+        RAISE NOTICE '% audit_logs row(s) older than % (cutoff %) are eligible', v_eligible, v_days, v_cutoff;
+        RETURN v_eligible;
+    END IF;
+    IF v_eligible = 0 THEN
+        RAISE NOTICE 'no audit_logs rows older than %', v_cutoff;
+        RETURN 0;
+    END IF;
+
+    PERFORM set_config('app.audit_retention', 'on', true);   -- local to this transaction
+    DELETE FROM audit_logs WHERE created_at < v_cutoff;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RAISE NOTICE 'purged % audit_logs row(s) older than %', v_deleted, v_cutoff;
+    RETURN v_deleted;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------------
 -- 5. Application DB role (least privilege). Run as superuser.
 --    The app may read/write business data but may NOT alter schema,
 --    nor modify/delete audit history.
@@ -129,7 +198,21 @@ BEGIN
         EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO school_app';
         EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO school_app';
         EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs, security_events FROM school_app';
+        -- the app may not run the retention purge either: that would be a way around the
+        -- append-only guard it is not allowed to lift
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT, BOOLEAN) FROM school_app';
+        -- the migration ledger is read-only for the app: it must be able to report whether
+        -- the schema is behind the code, but only a migration may write to it
+        EXECUTE 'GRANT SELECT ON schema_migrations TO school_app';
+        EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON schema_migrations FROM school_app';
         EXECUTE 'REVOKE CREATE ON SCHEMA public FROM school_app';
         EXECUTE 'REVOKE CREATE ON SCHEMA public FROM PUBLIC';
+
+        -- Tables created LATER must also be reachable, otherwise every new table silently
+        -- locks the app out until this script is re-run by hand.
+        EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO school_app';
+        EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                 GRANT USAGE, SELECT ON SEQUENCES TO school_app';
     END IF;
 END $$;

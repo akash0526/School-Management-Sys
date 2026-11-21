@@ -45,15 +45,39 @@ export interface FeesRepository {
   billableEnrollments(f: { academicYearId: number; classId?: number; sectionId?: number }): Promise<BillableEnrollment[]>;
   structuresFor(academicYearId: number, frequencies: Frequency[], feeTypeIds?: number[]): Promise<FeeStructureRow[]>;
   discountsFor(enrollmentIds: number[], onDate: string): Promise<DiscountRow[]>;
-  enrollmentsAlreadyBilled(enrollmentIds: number[], billingPeriod: string): Promise<Set<number>>;
+  /** Live (non-cancelled) invoices for these enrollments in this period. Pass the transaction to re-check under the same snapshot. */
+  enrollmentsAlreadyBilled(enrollmentIds: number[], billingPeriod: string, tx?: Tx): Promise<Set<number>>;
   nextInvoiceSeq(tx: Tx): Promise<number>;
   nextReceiptSeq(tx: Tx): Promise<number>;
 
-  createInvoice(
-    inv: { invoiceNo: string; enrollmentId: number; billingPeriod: string; issueDate: string; dueDate: string | null; createdBy: number },
-    items: Array<{ feeTypeId: number; description: string; amount: number; discount: number }>,
+  /**
+   * Insert a WHOLE batch of invoices in a handful of statements instead of ~5 per student.
+   *
+   * `invoices` is the complete set to write; each one carries its own lines. Returns the
+   * invoices that were actually created — an enrollment that another request billed for
+   * the same period between our check and this insert is skipped by ON CONFLICT and comes
+   * back absent, exactly as the per-student version returned null.
+   *
+   * The sequence is advanced once for the batch and invoice numbers are handed out from
+   * that block, so a failed batch burns numbers (they are never reused) but can never
+   * hand out a duplicate.
+   */
+  createInvoicesBatch(
+    batch: {
+      enrollmentId: number;
+      studentId: number;
+      items: Array<{ feeTypeId: number; description: string; amount: number; discount: number }>;
+    }[],
+    header: {
+      billingPeriod: string;
+      issueDate: string;
+      dueDate: string | null;
+      createdBy: number;
+      /** Builds an invoice number from a sequence value; the repo advances the sequence once per batch. */
+      invoiceNoFor: (seq: number) => string;
+    },
     tx: Tx,
-  ): Promise<{ id: number; totalAmount: number }>;
+  ): Promise<{ id: number; enrollmentId: number; totalAmount: number }[]>;
   addLedgerEntry(
     e: { studentId: number; enrollmentId?: number | null; entryDate: string; entryType: 'charge' | 'payment' | 'adjustment' | 'refund' | 'fine' | 'discount' | 'opening_balance'; invoiceId?: number | null; receiptId?: number | null; debit?: number; credit?: number; remarks?: string | null; createdBy: number },
     tx: Tx,

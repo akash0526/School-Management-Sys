@@ -2,6 +2,8 @@ import type { AuthUser } from '../../../shared/auth/types.js';
 import type { TransactionRunner } from '../../../shared/db/database.js';
 import type { EventBus } from '../../../shared/events/eventBus.js';
 import { badRequest, conflict, notFound } from '../../../shared/errors.js';
+import { todayInNepal } from '../../../shared/time.js';
+import { dobMessage, dobProblem } from './dob.js';
 import type { StudentAccessPolicy } from './students.policy.js';
 import type { GuardianInput, StudentInput, StudentsRepository, StudentStatus, UserAccountService } from './students.ports.js';
 
@@ -45,7 +47,14 @@ export class StudentsService {
   }
 
   async update(actor: AuthUser, id: number, input: Partial<StudentInput>) {
-    if (input.dob) this.assertDob(input.dob, input.admissionDate);
+    // Validate when EITHER value changes: moving the admission date earlier used to skip
+    // the check entirely, because it only ran when a dob was supplied.
+    if (input.dob !== undefined || input.admissionDate !== undefined) {
+      const current = await this.repo.findById(id);
+      if (!current) throw notFound('Student');
+      const stored = current as unknown as { dob: string; admissionDate: string | null };
+      this.assertDob(input.dob ?? stored.dob, input.admissionDate ?? stored.admissionDate);
+    }
     const s = await this.tx.transaction(actor.userId, (t) => this.repo.update(id, input, t));
     if (!s) throw notFound('Student');
     return s;
@@ -142,9 +151,22 @@ export class StudentsService {
     });
   }
 
-  private assertDob(dob: string, admissionDate?: string) {
-    if (new Date(dob) >= new Date(admissionDate ?? new Date().toISOString().slice(0, 10))) {
-      throw badRequest('Date of birth must be before the admission date');
-    }
+  /**
+   * A date of birth must fall before the admission date (and before today).
+   *
+   * Compared as 'YYYY-MM-DD' strings, never as Date objects:
+   *  - `new Date('2015-01-01')` is parsed as UTC midnight, so in Kathmandu (UTC+5:45) it
+   *    becomes 05:45 on the 1st — mixing that with a local-time "now" shifts the
+   *    comparison by a day at the boundary.
+   *  - `new Date().toISOString()` is the date in UTC, which is still YESTERDAY in Nepal
+   *    until 05:45 local. An admission entered just after midnight Nepal time would then
+   *    be compared against yesterday.
+   * Both are avoided by using the calendar date in Nepal, which is what the school means
+   * by "today". ISO dates also compare correctly as strings because they are fixed-width.
+   */
+  private assertDob(dob: string, admissionDate?: string | null) {
+    const today = todayInNepal();
+    const problem = dobProblem(dob, admissionDate, today);
+    if (problem) throw badRequest(dobMessage(problem), { dob, admissionDate: admissionDate ?? today });
   }
 }

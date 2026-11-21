@@ -71,6 +71,21 @@ export const marksBody = z
 export const verifyBody = z.object({ sectionId: id, classSubjectId: id.nullish() }).strict();
 export const processBody = z.object({ sectionId: id.nullish(), force: z.boolean().default(false) }).strict();
 export const publishBody = z.object({ published: z.boolean() }).strict();
+
+/**
+ * Withhold / release. Target either explicit enrollments or a whole section — one of the
+ * two is required, so a bare {withheld:true} can never withhold the entire school by accident.
+ */
+export const withholdBody = z
+  .object({
+    withheld: z.boolean(),
+    enrollmentIds: z.array(id).min(1).max(2000).optional(),
+    sectionId: id.optional(),
+  })
+  .strict()
+  .refine((b) => b.enrollmentIds || b.sectionId, {
+    message: 'Provide enrollmentIds (specific students) or sectionId (a whole section)',
+  });
 export const resultsQuery = z.object({ sectionId: id.optional() });
 export const reportCardParams = z.object({ id, studentId: id });
 export const studentResultsParams = z.object({ studentId: id });

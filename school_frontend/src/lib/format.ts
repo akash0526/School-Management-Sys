@@ -18,11 +18,19 @@ export function dateTime(d: string | null | undefined) {
   return dt.toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-/** Today as YYYY-MM-DD in the user's local timezone (not UTC). */
-export function today() {
-  const d = new Date()
+/** A Date as YYYY-MM-DD in the browser's local timezone (never UTC). */
+export function localDate(d: Date) {
   const p = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/**
+ * Today as YYYY-MM-DD in the user's local timezone (not UTC).
+ * `toISOString().slice(0,10)` would be wrong: in Nepal (UTC+5:45) it is still yesterday
+ * until 05:45, so "today's attendance" would open on the wrong date every morning.
+ */
+export function today() {
+  return localDate(new Date())
 }
 
 export const titleCase = (s: string | null | undefined) =>

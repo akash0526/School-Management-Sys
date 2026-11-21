@@ -62,6 +62,10 @@ export class ExamsController {
     await this.service.setPublished(getAuth(req), id, s.publishBody.parse(req.body).published);
     res.status(204).end();
   };
+  withhold = async (req: Request, res: Response) => {
+    const { id } = idParam.parse(req.params);
+    res.json(await this.service.setWithheld(getAuth(req), id, s.withholdBody.parse(req.body)));
+  };
   results = async (req: Request, res: Response) => {
     const { id } = idParam.parse(req.params);
     res.json({ items: await this.service.listResults(id, s.resultsQuery.parse(req.query).sectionId) });

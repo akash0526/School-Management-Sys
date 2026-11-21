@@ -2,18 +2,49 @@ import type { AuthUser } from '../../../shared/auth/types.js';
 import { hasPermission } from '../../../shared/auth/types.js';
 import type { TransactionRunner } from '../../../shared/db/database.js';
 import type { EventBus } from '../../../shared/events/eventBus.js';
+import { round2 } from '../../../shared/money.js';
 import { badRequest, conflict, forbidden, notFound } from '../../../shared/errors.js';
 import { todayInNepal } from '../../../shared/time.js';
 import type { DiscountRow, FeeStructureRow, FeesRepository, Frequency, PaymentMethod, StudentAccess } from './fees.ports.js';
 
-const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-/** Pure helper: discount for one fee line (percent or fixed, never more than the amount). */
-export function discountFor(amount: number, feeTypeId: number, discounts: DiscountRow[]): number {
-  const total = discounts
-    .filter((d) => d.feeTypeId === null || d.feeTypeId === feeTypeId)
-    .reduce((sum, d) => sum + (d.discountType === 'percent' ? (amount * d.value) / 100 : d.value), 0);
-  return round2(Math.min(total, amount));
+
+/**
+ * Pure helper: split a student's discounts across the fee lines of ONE invoice.
+ *
+ * A discount is either tied to a fee type (applies to that line) or "all fee types" (`feeTypeId = null`):
+ *  - percent discounts are proportional, so applying one per line is the same as applying it to the bill;
+ *  - a FIXED "all fee types" amount is a discount on the BILL (a staff-child or sibling allowance),
+ *    so it is applied ONCE and spread over the lines — never once per line, which would multiply it
+ *    by the number of fee types on the invoice.
+ *
+ * A line's discount never exceeds its own amount; a bill-wide fixed discount larger than the bill
+ * simply discounts it to zero (the excess is dropped rather than creating a negative line).
+ */
+export function discountsForInvoice(
+  lines: ReadonlyArray<{ feeTypeId: number; amount: number }>,
+  discounts: DiscountRow[],
+): number[] {
+  const perLine = lines.map((line) => {
+    const total = discounts
+      .filter((d) => d.feeTypeId === line.feeTypeId || (d.feeTypeId === null && d.discountType === 'percent'))
+      .reduce((sum, d) => sum + (d.discountType === 'percent' ? (line.amount * d.value) / 100 : d.value), 0);
+    return round2(Math.min(total, line.amount));
+  });
+
+  let remaining = round2(
+    discounts
+      .filter((d) => d.feeTypeId === null && d.discountType === 'fixed')
+      .reduce((sum, d) => sum + d.value, 0),
+  );
+  for (let i = 0; i < lines.length && remaining > 0; i++) {
+    const room = round2(lines[i].amount - perLine[i]);
+    if (room <= 0) continue;
+    const take = round2(Math.min(room, remaining));
+    perLine[i] = round2(perLine[i] + take);
+    remaining = round2(remaining - take);
+  }
+  return perLine;
 }
 
 /** Pure helper: pick fee lines for a class/stream — a stream-specific fee overrides the general one. */
@@ -85,14 +116,21 @@ export class FeesService {
     const enrollments = await this.repo.billableEnrollments(input);
     if (!enrollments.length) throw badRequest('No studying students match this selection');
     const structures = await this.repo.structuresFor(input.academicYearId, input.frequencies, input.feeTypeIds);
-    const already = await this.repo.enrollmentsAlreadyBilled(enrollments.map((e) => e.enrollmentId), input.billingPeriod);
     const discounts = await this.repo.discountsFor(enrollments.map((e) => e.enrollmentId), input.issueDate);
     const prefix = (await this.repo.getTextSetting('invoice_prefix')) ?? 'INV-';
+    const enrollmentIds = enrollments.map((e) => e.enrollmentId);
 
     return this.tx.transaction(actor.userId, async (t) => {
-      let created = 0;
-      let totalBilled = 0;
       const skipped = { alreadyBilled: 0, noFees: 0 };
+      // Re-check INSIDE the transaction: a check taken on the pool beforehand is a stale snapshot, so
+      // two requests could both see "not billed yet" and both insert. The unique index on
+      // (enrollment_id, billing_period) plus ON CONFLICT in createInvoicesBatch closes the remaining
+      // window (another transaction committing between this SELECT and our INSERT).
+      const already = await this.repo.enrollmentsAlreadyBilled(enrollmentIds, input.billingPeriod, t);
+
+      // Build every invoice in memory first, then write them in one batch. The work per student
+      // (pick fee lines, spread discounts) is pure; only the writes needed to be per-student.
+      const batch: Array<{ enrollmentId: number; studentId: number; items: Array<{ feeTypeId: number; description: string; amount: number; discount: number }> }> = [];
       for (const e of enrollments) {
         if (already.has(e.enrollmentId)) {
           skipped.alreadyBilled++;
@@ -104,35 +142,36 @@ export class FeesService {
           continue;
         }
         const myDiscounts = discounts.filter((d) => d.enrollmentId === e.enrollmentId);
-        const items = lines.map((l) => ({
-          feeTypeId: l.feeTypeId,
-          description: `${l.feeTypeName} — ${input.billingPeriod}`,
-          amount: l.amount,
-          discount: discountFor(l.amount, l.feeTypeId, myDiscounts),
-        }));
-        const seq = await this.repo.nextInvoiceSeq(t);
-        const invoice = await this.repo.createInvoice(
-          {
-            invoiceNo: `${prefix}${yearName}-${String(seq).padStart(6, '0')}`,
-            enrollmentId: e.enrollmentId,
-            billingPeriod: input.billingPeriod,
-            issueDate: input.issueDate,
-            dueDate: input.dueDate ?? null,
-            createdBy: actor.userId,
-          },
-          items,
-          t,
-        );
-        if (invoice.totalAmount > 0) {
-          await this.repo.addLedgerEntry(
-            { studentId: e.studentId, enrollmentId: e.enrollmentId, entryDate: input.issueDate, entryType: 'charge', invoiceId: invoice.id, debit: invoice.totalAmount, remarks: `Invoice ${input.billingPeriod}`, createdBy: actor.userId },
-            t,
-          );
-        }
-        created++;
-        totalBilled = round2(totalBilled + invoice.totalAmount);
+        const lineDiscounts = discountsForInvoice(lines, myDiscounts);
+        batch.push({
+          enrollmentId: e.enrollmentId,
+          studentId: e.studentId,
+          items: lines.map((l, i) => ({
+            feeTypeId: l.feeTypeId,
+            description: `${l.feeTypeName} — ${input.billingPeriod}`,
+            amount: l.amount,
+            discount: lineDiscounts[i],
+          })),
+        });
       }
-      return { created, totalBilled, skipped };
+      if (!batch.length) return { created: 0, totalBilled: 0, skipped };
+
+      const written = await this.repo.createInvoicesBatch(
+        batch,
+        {
+          billingPeriod: input.billingPeriod,
+          issueDate: input.issueDate,
+          dueDate: input.dueDate ?? null,
+          createdBy: actor.userId,
+          invoiceNoFor: (seq) => `${prefix}${yearName}-${String(seq).padStart(6, '0')}`,
+        },
+        t,
+      );
+      // Enrollments that another request billed between our check and the insert come back absent
+      // instead of raising: count them the same way the per-student path did.
+      skipped.alreadyBilled += batch.length - written.length;
+      const totalBilled = written.reduce((sum, inv) => round2(sum + inv.totalAmount), 0);
+      return { created: written.length, totalBilled, skipped };
     });
   }
 

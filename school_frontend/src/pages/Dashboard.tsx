@@ -6,7 +6,7 @@ import { Badge, Card, Empty, PageHeader, Stat } from '../components/ui'
 import { cx } from '../components/ui-utils'
 import { get, type Items, type Page } from '../lib/api'
 import { useAuth } from '../lib/auth'
-import { date, money } from '../lib/format'
+import { date, localDate, money } from '../lib/format'
 import { sectionLabel, useClassSubjects, useCurrentYear, useMyStaff, useSections } from '../lib/hooks'
 import { useBranding } from '../lib/school'
 import type { Assignment, CalendarEntry, Exam, FeesSummary, Staff, StudentRow } from '../lib/types'
@@ -41,7 +41,9 @@ function StaffDashboard({ now }: { now: Date }) {
   const sections = useSections(year?.id)
   const myClassSections = (sections.data ?? []).filter((s) => user?.staffId && s.classTeacherId === user.staffId)
 
-  const today = now.toISOString().slice(0, 10)
+  // `now.toISOString()` is UTC, which is still yesterday in Nepal until 05:45 —
+  // upcoming events would disappear for the first hours of the school day.
+  const today = localDate(now)
   const upcoming = (calendar.data?.items ?? []).filter((c) => c.endDate >= today).slice(0, 5)
   const f = fees.data
 
