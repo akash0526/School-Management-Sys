@@ -1,0 +1,51 @@
+{
+  "name": "school-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "School Management System API \u2014 modular, layered (api / business / data)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "create-admin": "tsx scripts/create-admin.ts",
+    "create-api-key": "tsx scripts/create-api-key.ts",
+    "test:e2e": "node tests/e2e/smoke.mjs",
+    "manage-api-key": "tsx scripts/manage-api-key.ts",
+    "db:reset": "bash scripts/db-reset.sh",
+    "db:demo": "bash scripts/db-reset.sh --demo"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.5",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^20.19.43",
+    "@types/pg": "^8.23.1",
+    "@types/supertest": "^7.2.1",
+    "pino-pretty": "^13.2.0",
+    "supertest": "^7.3.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12"
+  }
+}
