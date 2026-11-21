@@ -227,6 +227,7 @@ npm test            # 175 tests: unit (NEB grading, fees, invoice batching, publ
                     # + integration (headers, CORS, CSRF origin check, forged/revoked/legacy tokens, huge-array DoS)
                     # works on a fresh clone; the 3 database-backed checks skip (not fail) when no DB is reachable
 npm run db:test     # database rules: 42 must-be-rejected statements + trigger-computed invoice/grade checks
+npm run db:retention        # audit-log retention, dry run (add -- --apply to purge; see school_db/README.md)
                     # creates and drops its own throwaway database — safe to run any time
 npm run db:migrate:status   # is this database behind the code?
 npm run db:migrate          # upgrade a LIVE school without losing data (see school_db/README.md)

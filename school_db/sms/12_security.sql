@@ -137,14 +137,23 @@ INSERT INTO settings (key, value)
 VALUES ('audit_log_retention_days', '730'::jsonb)
 ON CONFLICT (key) DO NOTHING;
 
-CREATE OR REPLACE FUNCTION purge_audit_logs(p_days INT DEFAULT NULL)
+-- The previous signature was purge_audit_logs(INT). CREATE OR REPLACE cannot replace a
+-- function whose argument list changed — it would ADD an overload, leaving a bare
+-- purge_audit_logs() ambiguous ("function is not unique") on an upgraded database.
+DROP FUNCTION IF EXISTS purge_audit_logs(INT);
+
+CREATE OR REPLACE FUNCTION purge_audit_logs(p_days INT DEFAULT NULL, p_dry_run BOOLEAN DEFAULT NULL)
 RETURNS BIGINT AS $$
 DECLARE
+    v_dry_run  BOOLEAN;
     v_days     INT;
     v_cutoff   TIMESTAMPTZ;
     v_eligible BIGINT;
     v_deleted  BIGINT := 0;
 BEGIN
+    -- No argument at all = preview the configured window. An explicit window with
+    -- p_dry_run unset = preview it. p_dry_run wins whenever it is given.
+    v_dry_run := COALESCE(p_dry_run, p_days IS NULL);
     v_days := COALESCE(p_days, (SELECT (value #>> '{}')::INT FROM settings WHERE key = 'audit_log_retention_days'));
     IF v_days IS NULL OR v_days <= 0 THEN
         RAISE NOTICE 'audit retention is disabled (window = %); nothing purged', v_days;
@@ -157,8 +166,11 @@ BEGIN
     v_cutoff := now() - make_interval(days => v_days);
     SELECT count(*) INTO v_eligible FROM audit_logs WHERE created_at < v_cutoff;
 
-    -- no argument = dry run: report what is eligible, delete nothing
-    IF p_days IS NULL THEN
+    -- When the caller passes an explicit window they are previewing THAT window, so it
+    -- reports and stops. The guard is `v_dry_run`, not "p_days was NULL": keying the dry
+    -- run off the NULL check meant `purge_audit_logs(365)` silently used the CONFIGURED
+    -- window (730) for its count, and reported 8 eligible when 26 were.
+    IF v_dry_run THEN
         RAISE NOTICE '% audit_logs row(s) older than % (cutoff %) are eligible', v_eligible, v_days, v_cutoff;
         RETURN v_eligible;
     END IF;
@@ -188,7 +200,7 @@ BEGIN
         EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs, security_events FROM school_app';
         -- the app may not run the retention purge either: that would be a way around the
         -- append-only guard it is not allowed to lift
-        EXECUTE 'REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT) FROM school_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT, BOOLEAN) FROM school_app';
         -- the migration ledger is read-only for the app: it must be able to report whether
         -- the schema is behind the code, but only a migration may write to it
         EXECUTE 'GRANT SELECT ON schema_migrations TO school_app';

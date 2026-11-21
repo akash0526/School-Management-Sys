@@ -88,9 +88,14 @@ raises for every ordinary `DELETE`; it stands aside only when the session has ru
 cannot be rewritten, only aged out.
 
 ```sql
-SELECT purge_audit_logs();        -- dry run: how many rows are past the window
-SELECT purge_audit_logs(730);     -- actually delete rows older than two years
+SELECT purge_audit_logs();          -- preview the configured window
+SELECT purge_audit_logs(365);       -- preview a specific window
+SELECT purge_audit_logs(365, false);-- delete rows older than a year
 ```
+
+The second argument is dry-run-ness, and it defaults to *preview*: a call with no
+explicit `false` reports and stops. (Keying that off "was the window NULL" was a bug —
+`purge_audit_logs(365)` counted the *configured* 730-day window and under-reported.)
 
 The window lives in `settings.audit_log_retention_days` (default 730 days, two academic
 years) so a school can change it without a code deploy; `0` disables purging. A window
@@ -100,7 +105,28 @@ authentication records, small in volume, and the first thing an investigation ne
 
 The app role cannot run the purge (the migration revokes it), because the app role also
 cannot delete from `audit_logs` — letting it call the function would be a way around
-the guard. Schedule it as the table owner.
+the guard.
+
+#### Scheduling it
+
+`npm run db:retention` wraps the function so nobody has to remember the SQL:
+
+```bash
+npm run db:retention                 # dry run — what WOULD be purged, deletes nothing
+npm run db:retention -- --apply      # actually purge
+npm run db:retention -- --days 365   # preview a different window
+```
+
+**The dry run is the default on purpose.** This is the one operation that destroys audit
+history, so the thing scheduled unattended should be the read-only one — someone
+experimenting with a cron entry cannot lose data, they get a log line saying "would have
+purged N rows". Flip `--apply` once you have seen that line. The script exits non-zero on
+failure, so a scheduler can alert.
+
+```cron
+# 03:15 on the first of each month, as the database owner
+15 3 1 * *  cd /srv/school/school_backend && npm run db:retention -- --apply >> /var/log/school-retention.log 2>&1
+```
 
 ### Indexes
 

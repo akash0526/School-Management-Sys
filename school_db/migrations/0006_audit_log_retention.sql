@@ -85,15 +85,24 @@ ON CONFLICT (key) DO NOTHING;
 --    that WOULD be removed. Call it with a value, get a count back; no
 --    silent background mutation.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION purge_audit_logs(p_days INT DEFAULT NULL)
+-- The previous signature was purge_audit_logs(INT). CREATE OR REPLACE cannot replace a
+-- function whose argument list changed — it would ADD an overload, leaving a bare
+-- purge_audit_logs() ambiguous ("function is not unique") on an upgraded database.
+DROP FUNCTION IF EXISTS purge_audit_logs(INT);
+
+CREATE OR REPLACE FUNCTION purge_audit_logs(p_days INT DEFAULT NULL, p_dry_run BOOLEAN DEFAULT NULL)
 RETURNS BIGINT AS $$
 DECLARE
+    v_dry_run  BOOLEAN;
     v_days     INT;
     v_cutoff   TIMESTAMPTZ;
     v_eligible BIGINT;
     v_deleted  BIGINT := 0;
 BEGIN
     -- NULL means "use the configured window"; the settings row holds JSONB, so unwrap it.
+    -- No argument at all = preview the configured window. An explicit window with
+    -- p_dry_run unset = preview it. p_dry_run wins whenever it is given.
+    v_dry_run := COALESCE(p_dry_run, p_days IS NULL);
     v_days := COALESCE(p_days, (SELECT (value #>> '{}')::INT FROM settings WHERE key = 'audit_log_retention_days'));
 
     IF v_days IS NULL OR v_days <= 0 THEN
@@ -110,8 +119,11 @@ BEGIN
 
     SELECT count(*) INTO v_eligible FROM audit_logs WHERE created_at < v_cutoff;
 
-    -- p_days IS NULL is the dry run: report what is eligible, change nothing.
-    IF p_days IS NULL THEN
+    -- Report and stop when this call is a preview. The guard is `v_dry_run`, not "p_days
+    -- was NULL": keying the dry run off the NULL check meant purge_audit_logs(365) counted
+    -- the CONFIGURED window (730) instead of the one asked for, and reported 8 eligible
+    -- when 26 were.
+    IF v_dry_run THEN
         RAISE NOTICE '% audit_logs row(s) older than % (cutoff %) are eligible', v_eligible, v_days, v_cutoff;
         RETURN v_eligible;
     END IF;
@@ -133,7 +145,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION purge_audit_logs(INT) IS
+COMMENT ON FUNCTION purge_audit_logs(INT, BOOLEAN) IS
     'Deletes audit_logs rows older than the retention window (default from settings, 730 days). '
     'Call with no argument for a dry run. Requires UPDATE/DELETE privilege on audit_logs.';
 
@@ -145,7 +157,7 @@ COMMENT ON FUNCTION purge_audit_logs(INT) IS
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'school_app') THEN
-        REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT) FROM PUBLIC;
-        REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT) FROM school_app;
+        REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT, BOOLEAN) FROM PUBLIC;
+        REVOKE EXECUTE ON FUNCTION purge_audit_logs(INT, BOOLEAN) FROM school_app;
     END IF;
 END $$;

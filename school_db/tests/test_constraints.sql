@@ -236,12 +236,46 @@ END $$;
 DO $$
 DECLARE v INT;
 BEGIN
-    IF to_regprocedure('public.purge_audit_logs(integer)') IS NULL THEN
-        RAISE EXCEPTION 'purge_audit_logs(integer) is missing — audit_logs has no retention policy';
+    IF to_regprocedure('public.purge_audit_logs(integer, boolean)') IS NULL THEN
+        RAISE EXCEPTION 'purge_audit_logs(integer, boolean) is missing — audit_logs has no retention policy';
     END IF;
     SELECT (value #>> '{}')::INT INTO v FROM settings WHERE key = 'audit_log_retention_days';
     IF v IS NULL OR v < 30 THEN
         RAISE EXCEPTION 'audit_log_retention_days is missing or below the 30-day floor (got %)', v;
+    END IF;
+END $$;
+
+-- A dry run of an explicit window must both (a) report that window's rows and
+-- (b) delete nothing. Keying the dry run off "p_days IS NULL" made
+-- purge_audit_logs(30) silently use the configured 730-day window instead.
+DO $$
+DECLARE
+    v_reported BIGINT;
+    v_actual   BIGINT;
+    v_rows     BIGINT;
+BEGIN
+    INSERT INTO audit_logs (action, table_name, record_id, created_at)
+    VALUES ('INSERT', 'retention_probe', 'old',  now() - interval '400 days'),
+           ('INSERT', 'retention_probe', 'new',  now() - interval '10 days');
+    SELECT count(*) INTO v_rows FROM audit_logs WHERE table_name = 'retention_probe';
+
+    -- preview 365: the 400-day-old row qualifies, the 10-day-old one does not
+    v_reported := purge_audit_logs(365, true);
+    IF v_reported <> 1 THEN
+        RAISE EXCEPTION 'dry run of a 365-day window reported % eligible rows, expected 1', v_reported;
+    END IF;
+    SELECT count(*) INTO v_actual FROM audit_logs WHERE table_name = 'retention_probe';
+    IF v_actual <> v_rows THEN
+        RAISE EXCEPTION 'a dry run deleted rows (% before, % after)', v_rows, v_actual;
+    END IF;
+
+    -- and an actual purge of that window removes exactly the one row
+    v_actual := purge_audit_logs(365, false);
+    IF v_actual <> 1 THEN
+        RAISE EXCEPTION 'purging a 365-day window deleted % rows, expected 1', v_actual;
+    END IF;
+    IF EXISTS (SELECT 1 FROM audit_logs WHERE table_name = 'retention_probe' AND record_id = 'new') IS NOT TRUE THEN
+        RAISE EXCEPTION 'purging a 365-day window also deleted the 10-day-old row';
     END IF;
 END $$;
 

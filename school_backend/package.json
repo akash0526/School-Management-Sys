@@ -21,7 +21,8 @@
     "db:demo": "bash scripts/db-reset.sh --demo",
     "db:migrate": "tsx scripts/db-migrate.ts",
     "db:migrate:status": "tsx scripts/db-migrate.ts --status",
-    "db:test": "tsx scripts/test-constraints.ts"
+    "db:test": "tsx scripts/test-constraints.ts",
+    "db:retention": "tsx scripts/purge-audit.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
