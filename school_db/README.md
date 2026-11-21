@@ -19,23 +19,105 @@ school_db/
 │   ├── 09_library_transport.sql      library, transport
 │   ├── 10_communication_admissions.sql notices, events, SMS, homework, admissions
 │   ├── 11_audit_views.sql            audit log + public API views
+│   ├── 12_security.sql               audit coverage, append-only logs, grants
+│   ├── 13_migrations.sql             the schema_migrations ledger
 │   ├── 98_triggers.sql               auto updated_at triggers
 │   └── 99_seed.sql                   starter data (classes, NEB grades, roles...)
+├── migrations/                       ← numbered upgrades for LIVE databases
+│   ├── 0001_unique_invoice_per_period.sql
+│   ├── 0002_token_lookup_indexes.sql
+│   ├── 0003_optional_subject_must_be_optional.sql
+│   ├── 0004_sync_identity_sequences.sql
+│   ├── 0005_query_path_indexes.sql
+│   └── 0006_audit_log_retention.sql
+├── tests/test_constraints.sql        must-fail assertions (npm run db:test)
 └── website/                          ← DATABASE 2: school_website (public)
     └── schema.sql
 ```
 
 ## Installation
 
+**New installation** (empty database):
+
 ```bash
 # Database 1 — School Management System
 createdb school_sms
 psql -d school_sms -f school_db/sms/install.sql     # works from any folder
+cd school_backend && npm run db:migrate             # records the shipped migrations
 
 # Database 2 — Public Website
 createdb school_website
 psql -d school_website -f school_db/website/schema.sql
 ```
+
+**Upgrading an existing school** — never re-run `install.sql` on a live database, and
+never `db:reset` (it drops everything). Apply the migrations instead:
+
+```bash
+cd school_backend
+npm run db:migrate:status     # what is applied, what is pending
+npm run db:migrate -- --backup --dry-run    # see the plan, take a dump
+npm run db:migrate -- --backup              # apply (one transaction per file)
+```
+
+Each migration runs once, in name order, inside its own transaction: it either applies
+completely or leaves the database untouched. The ledger records a checksum, so editing an
+already-applied migration is reported as an error instead of silently diverging. The API
+also warns at startup when the database is behind the code.
+
+Some migrations cannot guess: `0001` refuses to create its unique index if duplicate
+invoices already exist, prints every duplicate group, and changes nothing. Read the
+report, decide which invoice to cancel, then re-run — or re-run with
+`-v allow_duplicates=1` to cancel all but the oldest automatically.
+
+### Keeping the database from growing without bound
+
+`0006_audit_log_retention.sql` gives `audit_logs` a retention window. It is worth a
+paragraph because it contradicts something the schema otherwise promises.
+
+`12_security.sql` makes `audit_logs` append-only with a trigger, so a compromised
+application account cannot erase evidence of what it did. That also meant *nobody*
+could ever delete anything: the table grows forever, one row per mark, per invoice and
+per ledger entry. A school of 600 students writes ~1,500 rows a year from invoicing
+alone, and a single exam marking season adds tens of thousands. Left alone the table
+becomes the largest thing in the database and the slowest part of every restore.
+
+The migration keeps the guard but gives it one declared way out. The trigger still
+raises for every ordinary `DELETE`; it stands aside only when the session has run
+`SET app.audit_retention = 'on'`, and only for `DELETE` — never for `UPDATE`, so history
+cannot be rewritten, only aged out.
+
+```sql
+SELECT purge_audit_logs();        -- dry run: how many rows are past the window
+SELECT purge_audit_logs(730);     -- actually delete rows older than two years
+```
+
+The window lives in `settings.audit_log_retention_days` (default 730 days, two academic
+years) so a school can change it without a code deploy; `0` disables purging. A window
+under 30 days is refused outright — a mistyped `purge_audit_logs(7)` should not shred a
+term's history. `security_events` is deliberately **not** purged: those are
+authentication records, small in volume, and the first thing an investigation needs.
+
+The app role cannot run the purge (the migration revokes it), because the app role also
+cannot delete from `audit_logs` — letting it call the function would be a way around
+the guard. Schedule it as the table owner.
+
+### Indexes
+
+`0005_query_path_indexes.sql` adds the three indexes the API's queries actually need:
+the student list's `ORDER BY first_name, last_name` (it previously sorted every student
+to return one page), `invoice_items.invoice_id` (invoice detail previously scanned all
+invoice lines in the school), and `events.start_at` (the unauthenticated public events
+calendar). It deliberately does **not** index all 98 unindexed foreign keys — that would
+add ~98 indexes to every school database, slowing every insert, for columns like
+`created_by` that are never filtered.
+
+The constraint suite asserts these objects exist: a missing index breaks nothing
+visibly, so without an assertion it would only show up as a slow school years later.
+
+**Adding a change**: edit the numbered files in `sms/` for fresh installs *and* add a
+migration for databases already running. Both are required; the constraint suite and CI
+(which replays every migration) catch the common mistakes.
 
 ---
 
@@ -51,14 +133,14 @@ psql -d school_website -f school_db/website/schema.sql
 └─────────┬────────────┘                        └────────────┬─────────────┘
           │                                                  │
    ┌──────▼─────────┐                              ┌─────────▼──────────┐
-   │ school_website │  22 tables                   │ school_sms         │  78 tables
+   │ school_website │  22 tables                   │ school_sms         │  80 tables
    │ (public data)  │                              │ (private data)     │  6 views
    └────────────────┘                              └────────────────────┘
 ```
 
 ---
 
-## Database 1: `school_sms` (78 tables)
+## Database 1: `school_sms` (80 tables)
 
 ### Module map
 
@@ -74,7 +156,7 @@ psql -d school_website -f school_db/website/schema.sql
 | 08 | **Payroll** | `salary_components`, `staff_salary_structures`, `payslips`, `payslip_items` |
 | 09 | **Library & Transport** | `books`, `book_copies`, `book_issues`, `vehicles`, `transport_routes`, `route_stops`, `student_transport` |
 | 10 | **Communication & Admissions** | `notices`, `notice_targets`, `events`, `notifications`, `sms_logs`, `assignments`, `assignment_submissions`, `admission_inquiries`, `admission_applications` |
-| 11 | **Audit & Views** | `audit_logs` · views: `v_student_balances`, `v_current_enrollments`, `public_notices`, `public_events`, `public_staff`, `public_results` |
+| 11 | **Audit & Views** | `audit_logs`, `security_events` · views: `v_student_balances`, `v_current_enrollments`, `public_notices`, `public_events`, `public_staff`, `public_results` |
 
 ### Core relationships
 
@@ -118,13 +200,20 @@ users ──1:1── students ──< student_guardians >── guardians ─�
 | **`public_*` views** | The only data the website API should expose. They contain no phone numbers, addresses, salaries or fees. |
 | **Audit triggers** | Every change to `students`, `marks`, `invoices`, `receipts`, `student_ledger` and `payslips` is logged with the user who made it. |
 
-### Rules enforced by the database (all tested)
+### Rules enforced by the database
+
+These are asserted by `tests/test_constraints.sql` — run it with `npm run db:test` from
+`school_backend/` (it creates and drops its own throwaway database). 42 must-be-rejected
+statements plus trigger-computed invoice and grade checks. The suite fails loudly if a
+statement it expects the database to reject is instead accepted, so a dropped constraint
+cannot pass silently.
+
 **Academic**
 - ✅ One enrollment per student per academic year, a unique roll number per section, and a unique symbol number per year
 - ✅ An enrollment, teacher assignment or timetable entry must use a section from the **same academic year**
 - ✅ Academic years can't overlap, and only one can be current
-- ✅ A chosen optional subject must belong to the student's own class, stream and year
-- ✅ No teacher or room clashes in a period
+- ✅ A chosen optional subject must be **optional** and belong to the student's own class, stream and year (a compulsory subject is never stored as a choice)
+- ✅ No teacher or room clashes in a period (parallel optional subjects in one slot are allowed on purpose)
 
 **Exams**
 - ✅ Marks can't exceed the full marks

@@ -1,0 +1,131 @@
+name: CI
+
+# The three layers this project actually depends on:
+#   1. Everything compiles (backend, and the frontend in its own strict config).
+#   2. The API's unit + integration tests pass against a real PostgreSQL.
+#   3. The DATABASE proves its own rules — money, marks, academic years and log
+#      immutability — and the whole demo school still seeds through the real API.
+# Anything that only works on one machine fails here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Obvious CI-only values; CI never reads a real secret.
+  DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/school_sms
+  DB_TEST_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  # generated for CI only; must not look like a placeholder (env.ts rejects those)
+  JWT_ACCESS_SECRET: cD3xR9pQ7wL2mN5vB8kH4jF6sT1yU0aZ3eG7iO9rX2cV5bN8mQ
+  API_RATE_LIMIT_PER_MIN: "100000"
+  LOG_LEVEL: error
+  NODE_ENV: test
+  PGPASSWORD: postgres
+
+jobs:
+  backend:
+    name: Backend — types, tests, database rules
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: school_backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: school_backend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: school_backend
+        run: npm run typecheck
+
+      # The schema is psql meta-commands (\ir, \set), so install it with psql rather
+      # than through a client library: this also keeps schema errors loud (ON_ERROR_STOP).
+      - name: Install schema
+        run: |
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE school_sms;'
+          psql -h 127.0.0.1 -U postgres -d school_sms -v ON_ERROR_STOP=1 -f school_db/sms/install.sql
+
+      # Unit tests must pass anywhere; the integration tests use the database above.
+      - name: Unit + integration tests
+        working-directory: school_backend
+        run: npm test
+
+      # Proves the schema rejects bad money/marks/years/log edits, and that the
+      # trigger-computed invoice and grade values are right.
+      - name: Database constraint tests
+        working-directory: school_backend
+        run: npm run db:test
+
+      # A fresh install must already carry the current shape, so migrations should be
+      # recorded, not executed. Then replay them to prove each one is idempotent —
+      # a migration that only works on an empty table would break a real school.
+      - name: Migrations are current and idempotent
+        working-directory: school_backend
+        run: |
+          npx tsx scripts/db-migrate.ts --status
+          npx tsx scripts/db-migrate.ts --force-run
+
+      # The demo school exercises nearly every endpoint (4900+ API calls) through the
+      # real services, so it catches breakage the unit tests cannot see.
+      - name: Demo school seeds through the real API
+        working-directory: school_backend
+        run: npx tsx scripts/seed-demo.ts --force
+
+      # Grants for the restricted app role. Must not error, even without school_app.
+      - name: Apply role grants
+        run: psql -h 127.0.0.1 -U postgres -d school_sms -v ON_ERROR_STOP=1 -f school_db/sms/12_security.sql
+
+  frontend:
+    name: Frontend — types, tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: school_frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: school_frontend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: school_frontend
+        run: npm run typecheck
+
+      # Date/money formatting and the 401-refresh-and-retry path in lib/api.ts. Pure logic,
+      # no browser needed — the Playwright run (npm run test:e2e) needs a live stack and is
+      # not part of CI.
+      - name: Unit tests
+        working-directory: school_frontend
+        run: npm test
+
+      - name: Build
+        working-directory: school_frontend
+        run: npm run build
