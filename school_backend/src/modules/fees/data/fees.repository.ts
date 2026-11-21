@@ -89,8 +89,8 @@ export class PgFeesRepository implements FeesRepository {
     );
     return rowsToCamel<DiscountRow>(rows);
   }
-  async enrollmentsAlreadyBilled(enrollmentIds: number[], billingPeriod: string) {
-    const { rows } = await this.db.query(
+  async enrollmentsAlreadyBilled(enrollmentIds: number[], billingPeriod: string, q: Queryable = this.db) {
+    const { rows } = await q.query(
       `SELECT DISTINCT enrollment_id FROM invoices
         WHERE enrollment_id = ANY($1::bigint[]) AND billing_period = $2 AND status <> 'cancelled'`,
       [enrollmentIds, billingPeriod],
@@ -104,26 +104,99 @@ export class PgFeesRepository implements FeesRepository {
     return (await q.query(`SELECT nextval('receipt_no_seq') AS n`)).rows[0].n as number;
   }
 
-  async createInvoice(
-    inv: { invoiceNo: string; enrollmentId: number; billingPeriod: string; issueDate: string; dueDate: string | null; createdBy: number },
-    items: Array<{ feeTypeId: number; description: string; amount: number; discount: number }>,
+  /**
+   * Insert a batch of invoices in five statements, not five per student.
+   *
+   * The per-student version cost ~5 round-trips per student (nextval, insert invoice,
+   * insert items, read totals, insert ledger charge). Billing a 600-student school was
+   * ~3,000 round-trips inside one transaction — fine on a local socket, but each one is
+   * a network RTT in production and the whole thing holds a transaction open for a
+   * minute. This writes the same rows with a constant number of statements.
+   *
+   * Correctness is unchanged:
+   *  - ON CONFLICT (enrollment_id, billing_period) DO NOTHING still closes the race with
+   *    a concurrent request; skipped enrollments simply do not come back in the result.
+   *  - The invoice totals come back from the DATABASE after the line items are inserted,
+   *    because the totals are computed by a trigger on invoice_items. Reading them from
+   *    the invoice row before the items exist would be 0.
+   *  - Ledger charges are posted in SQL from those database-computed totals, with the
+   *    same "only if total > 0" rule the service applied per student.
+   */
+  async createInvoicesBatch(
+    batch: Array<{ enrollmentId: number; studentId: number; items: Array<{ feeTypeId: number; description: string; amount: number; discount: number }> }>,
+    header: { billingPeriod: string; issueDate: string; dueDate: string | null; createdBy: number; invoiceNoFor: (seq: number) => string },
     q: Queryable,
   ) {
-    const { rows } = await q.query(
+    if (!batch.length) return [];
+
+    // 1. One round-trip for the whole block of sequence values.
+    const seqs = (await q.query(`SELECT nextval('invoice_no_seq') AS n FROM generate_series(1, $1::int)`, [batch.length])).rows
+      .map((r) => Number(r.n));
+
+    const rows = batch.map((b, i) => ({
+      invoice_no: header.invoiceNoFor(seqs[i]),
+      enrollment_id: b.enrollmentId,
+      student_id: b.studentId,
+      // an invoice with no lines bills nothing; keep the item list for the next statement
+      items: b.items.map((it) => ({ fee_type_id: it.feeTypeId, description: it.description, amount: it.amount, discount: it.discount })),
+    }));
+
+    // 2. Invoices. An enrollment already billed for this period is silently skipped.
+    const inserted = await q.query(
       `INSERT INTO invoices (invoice_no, enrollment_id, billing_period, issue_date, due_date, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [inv.invoiceNo, inv.enrollmentId, inv.billingPeriod, inv.issueDate, inv.dueDate, inv.createdBy],
+       SELECT x.invoice_no, x.enrollment_id, $2, $3, $4, $5
+         FROM jsonb_to_recordset($1::jsonb) AS x(invoice_no text, enrollment_id bigint, student_id bigint)
+       ON CONFLICT (enrollment_id, billing_period) WHERE status <> 'cancelled' AND billing_period IS NOT NULL
+       DO NOTHING
+       RETURNING id, enrollment_id`,
+      [JSON.stringify(rows), header.billingPeriod, header.issueDate, header.dueDate, header.createdBy],
     );
-    const id = rows[0].id as number;
-    await q.query(
-      `INSERT INTO invoice_items (invoice_id, fee_type_id, description, amount, discount)
-       SELECT $1, x.fee_type_id, x.description, x.amount, x.discount
-         FROM jsonb_to_recordset($2::jsonb) AS x(fee_type_id int, description text, amount numeric, discount numeric)`,
-      [id, JSON.stringify(items.map((i) => ({ fee_type_id: i.feeTypeId, description: i.description, amount: i.amount, discount: i.discount })))],
+    if (!inserted.rows.length) return [];
+
+    const idByEnrollment = new Map(inserted.rows.map((r) => [Number(r.enrollment_id), Number(r.id)] as const));
+    const created = rows.filter((r) => idByEnrollment.has(r.enrollment_id));
+
+    // 3. All line items at once.
+    const items = created.flatMap((r) =>
+      r.items.map((it) => ({ invoice_id: idByEnrollment.get(r.enrollment_id)!, ...it })),
     );
-    // totals were calculated by the DB trigger
-    const total = await q.query(`SELECT total_amount FROM invoices WHERE id = $1`, [id]);
-    return { id, totalAmount: total.rows[0].total_amount as number };
+    if (items.length) {
+      await q.query(
+        `INSERT INTO invoice_items (invoice_id, fee_type_id, description, amount, discount)
+         SELECT x.invoice_id, x.fee_type_id, x.description, x.amount, x.discount
+           FROM jsonb_to_recordset($1::jsonb) AS x(invoice_id bigint, fee_type_id int, description text, amount numeric, discount numeric)`,
+        [JSON.stringify(items)],
+      );
+    }
+
+    // 4. The trigger has now set subtotal/discount_total, so total_amount is final. Read it
+    //    once for the whole batch and post the ledger charges from it in the same statement.
+    const totals = await q.query(
+      `WITH billed AS (
+         SELECT i.id, i.enrollment_id, i.total_amount, e.student_id
+           FROM invoices i
+           JOIN jsonb_to_recordset($1::jsonb) AS x(invoice_id bigint) ON x.invoice_id = i.id
+           JOIN enrollments e ON e.id = i.enrollment_id
+       ), charged AS (
+         INSERT INTO student_ledger (student_id, enrollment_id, entry_date, entry_type, invoice_id, debit, remarks, created_by)
+         SELECT b.student_id, b.enrollment_id, $2, 'charge', b.id, b.total_amount, $3, $4
+           FROM billed b WHERE b.total_amount > 0
+         RETURNING 1
+       )
+       SELECT id, enrollment_id, total_amount FROM billed`,
+      [
+        JSON.stringify([...idByEnrollment.values()].map((id) => ({ invoice_id: id }))),
+        header.issueDate,
+        `Invoice ${header.billingPeriod}`,
+        header.createdBy,
+      ],
+    );
+
+    return (totals.rows as Array<{ id: string | number; enrollment_id: string | number; total_amount: string | number }>).map((r) => ({
+      id: Number(r.id),
+      enrollmentId: Number(r.enrollment_id),
+      totalAmount: Number(r.total_amount),
+    }));
   }
 
   async addLedgerEntry(

@@ -1,22 +1,79 @@
 import { describe, expect, it } from 'vitest';
-import { allocateFifo, discountFor, feeLinesFor } from '../../src/modules/fees/business/fees.service.js';
+import { allocateFifo, discountsForInvoice, feeLinesFor } from '../../src/modules/fees/business/fees.service.js';
 
-describe('discountFor', () => {
-  const amount = 3000;
-  it('applies percent and fixed discounts for the matching fee type and "all fees" discounts', () => {
+describe('discountsForInvoice', () => {
+  const one = [{ feeTypeId: 1, amount: 3000 }];
+
+  it('applies percent and fixed discounts for the matching fee type', () => {
     expect(
-      discountFor(amount, 1, [
+      discountsForInvoice(one, [
         { enrollmentId: 1, feeTypeId: 1, discountType: 'percent', value: 10 }, // 300
-        { enrollmentId: 1, feeTypeId: null, discountType: 'fixed', value: 200 }, // all types
+        { enrollmentId: 1, feeTypeId: 1, discountType: 'fixed', value: 200 }, // 200
         { enrollmentId: 1, feeTypeId: 2, discountType: 'fixed', value: 999 }, // other type: ignored
       ]),
-    ).toBe(500);
+    ).toEqual([500]);
   });
-  it('never discounts more than the amount', () => {
-    expect(discountFor(amount, 1, [{ enrollmentId: 1, feeTypeId: null, discountType: 'percent', value: 100 }, { enrollmentId: 1, feeTypeId: 1, discountType: 'fixed', value: 500 }])).toBe(3000);
+
+  it('applies a fixed "all fee types" discount ONCE for the whole bill, not once per line', () => {
+    const lines = [
+      { feeTypeId: 1, amount: 3000 },
+      { feeTypeId: 2, amount: 3000 },
+      { feeTypeId: 3, amount: 3000 },
+    ];
+    const result = discountsForInvoice(lines, [{ enrollmentId: 1, feeTypeId: null, discountType: 'fixed', value: 500 }]);
+    expect(result.reduce((a, b) => a + b, 0)).toBe(500); // was 1500 before the fix
   });
+
+  it('spreads a fixed "all fee types" discount over the lines in order and never over-discounts a line', () => {
+    const lines = [
+      { feeTypeId: 1, amount: 300 },
+      { feeTypeId: 2, amount: 1000 },
+    ];
+    const result = discountsForInvoice(lines, [{ enrollmentId: 1, feeTypeId: null, discountType: 'fixed', value: 500 }]);
+    expect(result).toEqual([300, 200]);
+    expect(result.reduce((a, b) => a + b, 0)).toBe(500);
+  });
+
+  it('applies an "all fee types" percent discount to every line (proportional, so equal to once on the bill)', () => {
+    const lines = [
+      { feeTypeId: 1, amount: 3000 },
+      { feeTypeId: 2, amount: 1000 },
+    ];
+    const result = discountsForInvoice(lines, [{ enrollmentId: 1, feeTypeId: null, discountType: 'percent', value: 10 }]);
+    expect(result).toEqual([300, 100]);
+  });
+
+  it('never discounts a line below zero, and drops a bill-wide discount larger than the bill', () => {
+    const lines = [
+      { feeTypeId: 1, amount: 1000 },
+      { feeTypeId: 2, amount: 500 },
+    ];
+    const result = discountsForInvoice(lines, [
+      { enrollmentId: 1, feeTypeId: 1, discountType: 'percent', value: 100 }, // 1000
+      { enrollmentId: 1, feeTypeId: null, discountType: 'fixed', value: 9000 }, // more than the bill
+    ]);
+    expect(result).toEqual([1000, 500]);
+  });
+
+  it('combines per-type and bill-wide discounts without double-counting the bill-wide one', () => {
+    const lines = [
+      { feeTypeId: 1, amount: 2000 }, // TUITION: 10% off + fixed 500 bill-wide
+      { feeTypeId: 2, amount: 1000 }, // EXAM: no per-type discount
+    ];
+    const result = discountsForInvoice(lines, [
+      { enrollmentId: 1, feeTypeId: 1, discountType: 'percent', value: 10 }, // 200
+      { enrollmentId: 1, feeTypeId: null, discountType: 'fixed', value: 500 }, // 500 once
+    ]);
+    expect(result).toEqual([700, 0]); // 200+500 on line 1, nothing left for line 2
+    expect(result.reduce((a, b) => a + b, 0)).toBe(700);
+  });
+
   it('rounds to paisa', () => {
-    expect(discountFor(1000, 1, [{ enrollmentId: 1, feeTypeId: 1, discountType: 'percent', value: 33.33 }])).toBe(333.3);
+    expect(discountsForInvoice([{ feeTypeId: 1, amount: 1000 }], [{ enrollmentId: 1, feeTypeId: 1, discountType: 'percent', value: 33.33 }])).toEqual([333.3]);
+  });
+
+  it('no discounts → every line gets 0', () => {
+    expect(discountsForInvoice([{ feeTypeId: 1, amount: 3000 }, { feeTypeId: 2, amount: 500 }], [])).toEqual([0, 0]);
   });
 });
 
