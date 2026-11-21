@@ -88,6 +88,14 @@ for (let i = 0; i < 3; i++) {
   students.push(s);
 }
 await expect('duplicate admission no', 409, call('POST', '/students', { token: admin, body: { admissionNo: `ADM-${sfx}-1`, firstName: 'X', lastName: 'Y', gender: 'male', dob: '2010-01-01' } }));
+
+// date-of-birth rules: a person is born before they are admitted, and never in the future
+await expect('future dob rejected', 400, call('POST', '/students', { token: admin, body: {
+  admissionNo: `ADM-${sfx}-future`, firstName: 'Future', lastName: 'Kid', gender: 'male', dob: '2099-01-01' } }));
+await expect('dob equal to admission date rejected', 400, call('POST', '/students', { token: admin, body: {
+  admissionNo: `ADM-${sfx}-same`, firstName: 'Same', lastName: 'Day', gender: 'male', dob: today, admissionDate: today } }));
+await expect('dob before admission date accepted', 201, call('POST', '/students', { token: admin, body: {
+  admissionNo: `ADM-${sfx}-ok`, firstName: 'Valid', lastName: 'Entry', gender: 'female', dob: '2012-03-04', admissionDate: today } }));
 const g = await expect('add guardian to student 1', 201, call('POST', `/students/${students[0].id}/guardians`, { token: admin, body: { relation: 'father', isPrimary: true, guardian: { fullName: 'Krishna Thapa', phone: '9811111111' } } }));
 await expect('guardian login account', 201, call('POST', `/guardians/${g.guardianId}/account`, { token: admin, body: { username: `p${sfx}`.toLowerCase(), password: 'Temp1234abc' } }));
 const enr = [];
@@ -156,6 +164,34 @@ check('student 3 absent in ENG theory → not graded', r3?.resultStatus !== 'gra
 const card = await expect('parent sees published report card', 200, call('GET', `/exams/${exam.id}/report-cards/${students[0].id}`, { token: pTok }));
 check('report card has subjects', JSON.stringify(card).includes(`ENG${sfx}`), card);
 
+// ── withholding: an official decision, visible to the family but without numbers
+const order = (await call('GET', `/exams/${exam.id}/results?sectionId=${section.id}`, { token: admin })).data.items;
+const top = order.find((r) => r.rankInSection === 1);
+const wh = await expect('withhold the top student', 200, call('POST', `/exams/${exam.id}/withhold`, { token: admin, body: { withheld: true, enrollmentIds: [top.enrollmentId] } }));
+check('withhold reports 1 change', wh.updated === 1, wh);
+const whList = (await call('GET', `/exams/${exam.id}/results?sectionId=${section.id}`, { token: admin })).data.items;
+const whTop = whList.find((r) => r.enrollmentId === top.enrollmentId);
+check('withheld student shows status with no GPA/grade', whTop.resultStatus === 'withheld' && whTop.gpa === null && whTop.finalGrade === null, whTop);
+const whCard = await expect('family still sees the report card (result withheld)', 200, call('GET', `/exams/${exam.id}/report-cards/${students[0].id}`, { token: pTok }));
+check('withheld card hides every number', whCard.resultStatus === 'withheld' && whCard.gpa === null && whCard.percentage === null && whCard.finalGrade === null, whCard);
+check('withheld card lists the subjects sat, with no marks', whCard.subjects.length > 0 && whCard.subjects.every((s) => s.totalObtained === null && s.grade === 'WITHHELD'), whCard.subjects);
+check('withheld card exposes no rank', whCard.rankInSection === null && whCard.rankInClass === null, whCard);
+await expect('withhold needs a target (never the whole school by accident)', 400, call('POST', `/exams/${exam.id}/withhold`, { token: admin, body: { withheld: true } }));
+await expect('release', 200, call('POST', `/exams/${exam.id}/withhold`, { token: admin, body: { withheld: false, enrollmentIds: [top.enrollmentId] } }));
+const relList = (await call('GET', `/exams/${exam.id}/results?sectionId=${section.id}`, { token: admin })).data.items;
+const relTop = relList.find((r) => r.enrollmentId === top.enrollmentId);
+check('released student is graded again with the SAME gpa', relTop.resultStatus === 'graded' && relTop.gpa === top.gpa, { before: top.gpa, after: relTop.gpa });
+await expect('release with nothing withheld is a conflict', 409, call('POST', `/exams/${exam.id}/withhold`, { token: admin, body: { withheld: false, enrollmentIds: [top.enrollmentId] } }));
+
+// re-processing must NOT silently release a withheld result
+await expect('withhold again', 200, call('POST', `/exams/${exam.id}/withhold`, { token: admin, body: { withheld: true, enrollmentIds: [top.enrollmentId] } }));
+await expect('unpublish to re-process', 204, call('POST', `/exams/${exam.id}/publish`, { token: admin, body: { published: false } }));
+await expect('re-process results', 200, call('POST', `/exams/${exam.id}/process`, { token: admin, body: { sectionId: section.id } }));
+const afterReprocess = (await call('GET', `/exams/${exam.id}/results?sectionId=${section.id}`, { token: admin })).data.items;
+check('re-processing preserved the withheld status', afterReprocess.find((r) => r.enrollmentId === top.enrollmentId)?.resultStatus === 'withheld', afterReprocess.find((r) => r.enrollmentId === top.enrollmentId));
+await expect('release after re-process', 200, call('POST', `/exams/${exam.id}/withhold`, { token: admin, body: { withheld: false, enrollmentIds: [top.enrollmentId] } }));
+await expect('re-publish', 204, call('POST', `/exams/${exam.id}/publish`, { token: admin, body: { published: true } }));
+
 // ───────────────────────── fees
 console.log('Fees');
 const ft = await expect('create fee type', 201, call('POST', '/fees/types', { token: admin, body: { code: `TUI_${sfx.replace(/[0-9]/g, 'X')}`, name: `Tuition ${sfx}` } }));
@@ -167,6 +203,26 @@ const gen = await expect('generate invoices', 201, call('POST', '/fees/invoices/
 check('3 invoices, 2700+3000+3000 = 8700', gen.created === 3 && gen.totalBilled === 8700, gen);
 const gen2 = await expect('re-generate is idempotent', 201, call('POST', '/fees/invoices/generate', { token: admin, body: { academicYearId: year.id, sectionId: section.id, billingPeriod: period, frequencies: ['monthly'], feeTypeIds: [ft.id], issueDate: today } }));
 check('second run skips all 3', gen2.created === 0 && gen2.skipped.alreadyBilled === 3, gen2);
+// The batch write replaces a per-student loop, so the things that loop guaranteed need their own
+// assertions: the ledger charge must match the invoice the DB computed, and a second run must not
+// double-charge. Totals come from a trigger on invoice_items, so a batch that read the invoice
+// row before its items existed would silently post 0.
+const invList = await expect('invoice list for the period', 200, call('GET', `/fees/invoices?billingPeriod=${encodeURIComponent(period)}&limit=50`, { token: admin }));
+const invRows = invList.items ?? [];
+check('3 invoices visible in the period', invRows.length === 3, { n: invRows.length });
+check('invoice totals are non-zero (trigger computed after items)', invRows.every((i) => i.totalAmount > 0), invRows.map((i) => i.totalAmount));
+const stmt = await expect('student 1 statement after generate', 200, call('GET', `/fees/students/${students[0].id}/statement`, { token: admin }));
+const charge = (stmt.entries ?? []).filter((e) => e.entryType === 'charge');
+check('exactly one charge row per invoice (no double posting)', charge.length === 1, charge);
+check('ledger debit equals the discounted invoice total 2700', charge.length === 1 && charge[0].debit === 2700, charge);
+check('balance equals the charge before any payment', stmt.balance === 2700, stmt.balance);
+// re-running the batch must not add ledger rows
+const before = (await call('GET', `/fees/students/${students[0].id}/statement`, { token: admin })).data;
+await expect('re-generate same period again', 201, call('POST', '/fees/invoices/generate', { token: admin, body: { academicYearId: year.id, sectionId: section.id, billingPeriod: period, frequencies: ['monthly'], feeTypeIds: [ft.id], issueDate: today } }));
+const after = (await call('GET', `/fees/students/${students[0].id}/statement`, { token: admin })).data;
+check('re-run posts no extra ledger rows', after.entries.length === before.entries.length, { before: before.entries.length, after: after.entries.length });
+check('re-run leaves the balance unchanged', after.balance === before.balance, { before: before.balance, after: after.balance });
+
 await expect('eSewa without reference rejected', 400, call('POST', '/fees/receipts', { token: admin, body: { studentId: students[0].id, amount: 1000, method: 'esewa' } }));
 const rc1 = await expect('collect 2000 cash (partial)', 201, call('POST', '/fees/receipts', { token: admin, body: { studentId: students[0].id, amount: 2000, method: 'cash' } }));
 const inv1 = rc1.allocations[0].invoiceId;
